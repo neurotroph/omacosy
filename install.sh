@@ -195,6 +195,12 @@ pkill -f "Karabiner-Menu|Karabiner-NotificationWindow" 2>/dev/null || true
 
 # theme scripts on PATH (aerospace's theme chord calls ~/.local/bin/theme-next)
 mkdir -p "$HOME/.local/bin"
+# A clean macOS install has no ~/Library/LaunchAgents, and the three
+# agents below are written with `cat >`, which does not make one. Under
+# `set -e` that ends the install partway through — after Homebrew and
+# after every binary is built — on precisely the fresh Mac the README
+# opens with.
+mkdir -p "$HOME/Library/LaunchAgents"
 
 # tiny compiled helper (cursor position, wallpaper) — replaces the
 # cliclick and desktoppr dependencies; swiftc ships with the CLT that
