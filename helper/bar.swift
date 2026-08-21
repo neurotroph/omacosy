@@ -924,9 +924,16 @@ func updateWeather() {
         w.high = text(today, "maxtempC")
         w.humidity = text(current, "humidity")
 
+        // The one place a value off the network reaches an array
+        // index. Swift's % keeps the dividend's sign, so a negative
+        // winddirDegree (nothing wttr.in sends, everything a
+        // substituted endpoint could) indexes at -2 and traps —
+        // and KeepAlive would turn that into a restart loop. The
+        // extra +8 %8 costs nothing and leaves 0-359 unchanged.
         let degrees = Int(text(current, "winddirDegree")) ?? 0
         let arrows = ["↓", "↙", "←", "↖", "↑", "↗", "→", "↘"]
-        w.wind = "\(arrows[((degrees + 180) / 45) % 8]) \(text(current, "windspeedKmph")) km/h"
+        let arrow = arrows[(((degrees + 180) / 45) % 8 + 8) % 8]
+        w.wind = "\(arrow) \(text(current, "windspeedKmph")) km/h"
 
         // rain earns a row only with real signal: falling now, or likely today
         let precip = Double(text(current, "precipMM")) ?? 0
