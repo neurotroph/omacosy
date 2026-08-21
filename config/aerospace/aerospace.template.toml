@@ -49,9 +49,13 @@ on-focused-monitor-changed = ['move-mouse monitor-lazy-center']
 on-focus-changed = ['exec-and-forget $HOME/.local/bin/omacosy-helper split-hint']
 
 # Tell the bar which workspace is focused — a bash builtin redirect,
-# no extra process, and a regular file so a dead reader cannot wedge it
+# no extra process, and a regular file so a dead reader cannot wedge it.
+# The files sit in ~/.local/state/omacosy/run (mode 700) rather than
+# /tmp: `>` follows a symlink, so a predictable name in a
+# world-writable directory is an arbitrary-file-truncate waiting for
+# another local uid to claim it.
 exec-on-workspace-change = ['/bin/bash', '-c',
-  'touch /tmp/omacosy-ws-switch; echo "$AEROSPACE_FOCUSED_WORKSPACE" > /tmp/omacosy-bar-ws; $HOME/.local/bin/omacosy-focus-guard'
+  'R="$HOME/.local/state/omacosy/run"; mkdir -p "$R"; touch "$R/ws-switch"; echo "$AEROSPACE_FOCUSED_WORKSPACE" > "$R/bar-ws"; $HOME/.local/bin/omacosy-focus-guard'
 ]
 
 [gaps]
@@ -112,7 +116,7 @@ cmd-ctrl-alt-shift-right = 'move right'
 cmd-ctrl-alt-t = 'layout floating tiling'
 # Keybinding cheatsheet (omarchy: Super+K) — the bar renders it from
 # THIS file, so the sheet cannot drift from the keys it documents.
-cmd-ctrl-alt-k = 'exec-and-forget /usr/bin/touch /tmp/omacosy-bar-cheatsheet'
+cmd-ctrl-alt-k = 'exec-and-forget /usr/bin/touch $HOME/.local/state/omacosy/run/bar-cheatsheet'
 
 # Floats
 # Surface the next float on this workspace (S for surface). macOS

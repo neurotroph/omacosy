@@ -16,7 +16,10 @@ export PATH="/opt/homebrew/bin:$PATH"
 
 STATE_DIR="$HOME/.local/state/omacosy"
 MAP="$STATE_DIR/collapse-map"
-mkdir -p "$STATE_DIR"
+# runtime dir (mode 700) — logs and IPC pokes used to sit in /tmp,
+# where any other local uid can plant a symlink at a known name
+RUN="$STATE_DIR/run"
+mkdir -p "$RUN"
 
 case "${1:-}" in
   collapse)
@@ -28,7 +31,7 @@ case "${1:-}" in
     TARGETS=()
     for s in 1 2 3 4 5 6 7 8 9; do
       if ! WOUT="$(aerospace list-windows --workspace "$s" --format '%{window-id}' 2>&1)"; then
-        echo "$(date '+%F %T') collapse aborted: ws $s probe failed" >>/tmp/omacosy-ws-collapse.log
+        echo "$(date '+%F %T') collapse aborted: ws $s probe failed" >>"$RUN/ws-collapse.log"
         exit 0
       fi
       [ -z "$WOUT" ] && TARGETS+=("$s")
@@ -46,11 +49,11 @@ case "${1:-}" in
         aerospace move-node-to-workspace --window-id "$wid" "$T" 2>/dev/null &&
           printf '%s\t%s\n' "$wid" "$gws" >>"$MAP"
       done
-      echo "$(date '+%F %T') collapsed $gws -> $T" >>/tmp/omacosy-ws-collapse.log
+      echo "$(date '+%F %T') collapsed $gws -> $T" >>"$RUN/ws-collapse.log"
     done
     # moving between two HIDDEN workspaces emits no SkyLight event
     # (nothing on screen changed), so poke the bar directly
-    : > /tmp/omacosy-bar-moved
+    : > "$RUN/bar-moved"
     ;;
   restore)
     [ -s "$MAP" ] || exit 0
@@ -64,10 +67,10 @@ case "${1:-}" in
     while IFS=$'\t' read -r wid gws; do
       [ -n "$wid" ] && [ -n "$gws" ] || continue
       aerospace move-node-to-workspace --window-id "$wid" "$gws" 2>/dev/null &&
-        echo "$(date '+%F %T') restored $wid -> $gws" >>/tmp/omacosy-ws-collapse.log
+        echo "$(date '+%F %T') restored $wid -> $gws" >>"$RUN/ws-collapse.log"
     done <"$MAP.run"
     rm -f "$MAP.run"
-    : > /tmp/omacosy-bar-moved
+    : > "$RUN/bar-moved"
     ;;
   *)
     echo "usage: omacosy-ws-collapse <collapse|restore>" >&2

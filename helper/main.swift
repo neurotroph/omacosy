@@ -283,7 +283,14 @@ case "split-hint":
         return (x, y, w, h)
     }
     let splitWidthMultiplier: CGFloat = 1.4
-    let statePath = "/tmp/omacosy-split-state-\(getuid())"
+    // ~/.local/state (mode 700), not /tmp: a world-writable directory
+    // lets any other local uid plant a symlink at a predictable name
+    // and redirect these writes.
+    let runDir = "\(NSHomeDirectory())/.local/state/omacosy/run"
+    try? FileManager.default.createDirectory(
+        atPath: runDir, withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700])
+    let statePath = "\(runDir)/split-state"
     let now = Date().timeIntervalSince1970
     var state: (wid: UInt32, w: CGFloat, h: CGFloat)?
     if let line = try? String(contentsOfFile: statePath, encoding: .utf8) {
@@ -342,9 +349,9 @@ case "split-hint":
     split.waitUntilExit()
     try? "\(wid) \(w) \(h) \(now)".write(toFile: statePath, atomically: true, encoding: .utf8)
     if let d = "\(Date().timeIntervalSince1970) wid=\(idStr) \(Int(w))x\(Int(h)) (\(how)) -> \(dir == "horizontal" ? "h" : "v") rc=\(split.terminationStatus)\n".data(using: .utf8),
-        let fh = FileHandle(forWritingAtPath: "/tmp/omacosy-split-hint.log") ?? {
-            FileManager.default.createFile(atPath: "/tmp/omacosy-split-hint.log", contents: nil)
-            return FileHandle(forWritingAtPath: "/tmp/omacosy-split-hint.log")
+        let fh = FileHandle(forWritingAtPath: "\(runDir)/split-hint.log") ?? {
+            FileManager.default.createFile(atPath: "\(runDir)/split-hint.log", contents: nil)
+            return FileHandle(forWritingAtPath: "\(runDir)/split-hint.log")
         }() {
         fh.seekToEndOfFile(); fh.write(d); fh.closeFile()
     }

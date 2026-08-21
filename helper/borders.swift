@@ -241,7 +241,19 @@ func displayOf(_ r: CGRect) -> CGDirectDisplayID {
     return 0
 }
 
-let logURL = URL(fileURLWithPath: "/tmp/omacosy-borders.log")
+// Runtime files live under ~/.local/state (mode 700), never in /tmp:
+// a world-writable directory means any other local uid can plant a
+// symlink at one of these predictable names and have this process
+// write through it.
+let runDir: String = {
+    let d = "\(NSHomeDirectory())/.local/state/omacosy/run"
+    try? FileManager.default.createDirectory(
+        atPath: d, withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700])
+    return d
+}()
+
+let logURL = URL(fileURLWithPath: "\(runDir)/borders.log")
 let logFmt: ISO8601DateFormatter = {
     let f = ISO8601DateFormatter()
     f.formatOptions.insert(.withFractionalSeconds)
@@ -376,7 +388,7 @@ func kickTick() {
 }
 
 // drag diagnostics: one log line per chatty second (drags, relayouts)
-// so "the ring lags" is answerable from /tmp/omacosy-borders.log —
+// so "the ring lags" is answerable from run/borders.log —
 // events/s ≈ 60 means the pipeline flows and any trail is compositor
 // latency; events/s ≈ 2 means the heartbeat is carrying a window the
 // move-subscription lost.
@@ -532,7 +544,7 @@ func watch(_ path: String, create: Bool, handler: @escaping () -> Void) {
 // (exec-on-workspace-change): hide instantly and arm the stability
 // gate — the SLS move-burst alone can't distinguish a switch from a
 // drag until the ghosts are already ringed
-watch("/tmp/omacosy-ws-switch", create: true) {
+watch("\(runDir)/ws-switch", create: true) {
     lastWsSwitchAt = Date()
     hideRing("workspace-switch")
     syncShroud(nil) // the next tick re-covers if the target is fullscreen too

@@ -58,7 +58,7 @@ Small repo, strong opinions. PRs are welcome when they keep these.
 
 - Test on stock bash: `bash -n` is the floor, `/bin/bash script.sh`
   is the truth.
-- The debug story is `/tmp/omacosy-*.log` — daemons `tlog` there.
+- The debug story is `~/.local/state/omacosy/run/*.log` — daemons `tlog` there.
   Keep it that way; it is what bug reports run on.
 - Theme packs are the easiest contribution: copy a directory under
   `themes/`, provide `colors.toml`, `sketchybar.sh` (the bar reads its

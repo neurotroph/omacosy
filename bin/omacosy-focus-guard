@@ -10,9 +10,13 @@
 # `omacosy-helper input-age`) or the swipe daemon's intent stamp (raw
 # multitouch contacts emit no CGEvents) is ≤2s old. Anything else is
 # an app self-activation: send the workspace straight back.
-U=$(id -u)
-BOUNCE="/tmp/omacosy-guard-bounce-$U"
-INTENT="/tmp/omacosy-user-intent-$U"
+# ~/.local/state (mode 700), not /tmp: these names are predictable,
+# and in a world-writable directory a planted symlink would redirect
+# every write below.
+RUN="$HOME/.local/state/omacosy/run"
+mkdir -p "$RUN"
+BOUNCE="$RUN/guard-bounce"
+INTENT="$RUN/user-intent"
 
 # our own bounce landing — consume the marker instead of re-judging
 # (would otherwise ping-pong forever)
@@ -27,7 +31,7 @@ fi
 # one bounce per 3s window: aerospace can deliver hooks for rapid
 # switches out of order, so a marker mismatch must not let two guard
 # instances ping-pong the desktop between workspaces
-COOLDOWN="/tmp/omacosy-guard-cooldown-$U"
+COOLDOWN="$RUN/guard-cooldown"
 if [ -f "$COOLDOWN" ]; then
   CAGE=$(($(date +%s) - $(stat -f %m "$COOLDOWN")))
   [ "$CAGE" -le 3 ] && exit 0
@@ -43,7 +47,7 @@ IN_AGE=$("$HOME/.local/bin/omacosy-helper" input-age 2>/dev/null)
 case "$IN_AGE" in '' | *[!0-9.]*) exit 0 ;; esac
 awk -v a="$IN_AGE" 'BEGIN{exit !(a <= 2.0)}' && exit 0
 
-echo "$(date '+%F %T') bounced $AEROSPACE_FOCUSED_WORKSPACE -> $AEROSPACE_PREV_WORKSPACE (input ${IN_AGE}s ago)" >>/tmp/omacosy-focus-guard.log
+echo "$(date '+%F %T') bounced $AEROSPACE_FOCUSED_WORKSPACE -> $AEROSPACE_PREV_WORKSPACE (input ${IN_AGE}s ago)" >>"$RUN/focus-guard.log"
 touch "$COOLDOWN"
 printf '%s' "$AEROSPACE_PREV_WORKSPACE" >"$BOUNCE"
 exec /opt/homebrew/bin/aerospace workspace "$AEROSPACE_PREV_WORKSPACE"

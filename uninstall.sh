@@ -27,12 +27,11 @@ rm -f "$HOME/Library/LaunchAgents/com.omacosy.dwindle.plist" "$HOME/.local/bin/o
 launchctl unload "$HOME/Library/LaunchAgents/com.omacosy.bar.plist" 2>/dev/null || true
 rm -f "$HOME/Library/LaunchAgents/com.omacosy.bar.plist" "$HOME/.local/bin/omacosy-bar"
 rm -rf "$HOME/.local/share/omacosy/omacosy-bar.app"
-# overview is self-daemonizing (no launchd agent) — kill by pidfile
-# /tmp is shared. `[ -f ]` follows symlinks, so without the -L check a
-# link planted at this path could point at a file holding someone
-# else's pid and we would signal that instead. The contents are also
-# only trusted as far as "digits".
-PIDFILE="/tmp/omacosy-overview-$(id -u).pid"
+# overview is self-daemonizing (no launchd agent) — kill by pidfile.
+# It lives in the mode-700 runtime dir now, but the -L check stays:
+# `[ -f ]` follows symlinks, and trusting the contents no further than
+# "digits" costs nothing.
+PIDFILE="$HOME/.local/state/omacosy/run/overview.pid"
 if [ -f "$PIDFILE" ] && [ ! -L "$PIDFILE" ]; then
   OVERVIEW_PID="$(cat "$PIDFILE" 2>/dev/null || true)"
   case "$OVERVIEW_PID" in
@@ -41,12 +40,16 @@ if [ -f "$PIDFILE" ] && [ ! -L "$PIDFILE" ]; then
   esac
 fi
 rm -f "$HOME/.local/bin/omacosy-overview" "$HOME/.local/bin/omacosy-toggle"
-rm -f /tmp/omacosy-*.log /tmp/omacosy-*.err "/tmp/omacosy-overview-$(id -u).pid" \
-  "/tmp/omacosy-overlay-active-$(id -u)" /tmp/omacosy-ws-switch \
-  "/tmp/omacosy-user-intent-$(id -u)" \
-  "/tmp/omacosy-guard-bounce-$(id -u)" \
-  "/tmp/omacosy-guard-cooldown-$(id -u)" \
-  "${TMPDIR:-/tmp}/omacosy-monitor-count"
+# The runtime dir goes with ~/.local/state/omacosy at the end of this
+# script. These are the leftovers from when all of it lived in /tmp —
+# `rm -f` unlinks a planted symlink instead of following it, and the
+# sticky bit means another user's file simply refuses to go.
+rm -f /tmp/omacosy-*.log /tmp/omacosy-*.err /tmp/omacosy-bar-ws \
+  /tmp/omacosy-bar-moved /tmp/omacosy-bar-cheatsheet /tmp/omacosy-ws-switch \
+  "/tmp/omacosy-overview-$(id -u).pid" "/tmp/omacosy-overlay-active-$(id -u)" \
+  "/tmp/omacosy-user-intent-$(id -u)" "/tmp/omacosy-split-state-$(id -u)" \
+  "/tmp/omacosy-guard-bounce-$(id -u)" "/tmp/omacosy-guard-cooldown-$(id -u)" 2>/dev/null || true
+rmdir "/tmp/omacosy-spawn-$(id -u).lock.d" 2>/dev/null || true
 rm -rf "$HOME/.config/omacosy"
 
 # aerospace-swipe: ONLY if we cloned it — a pre-existing install

@@ -113,9 +113,10 @@ Refuse the grant and you lose the name, nothing else.
   keyboard event tap. Only Karabiner sees keys, which is inherent to
   remapping one. AerospaceSwipe's event tap is gesture-only and
   listen-only (`1 << NSEventTypeGesture`, `kCGEventTapOptionListenOnly`),
-  so it cannot see or alter a keystroke. Debug logs
-  (`/tmp/omacosy-*.log`) carry window titles, app names and workspace
-  numbers, never input.
+  so it cannot see or alter a keystroke. Debug logs live in
+  `~/.local/state/omacosy/run/` (mode 700, so only you can read them);
+  they carry window titles, app names and workspace numbers, never
+  input.
 
 Grants are tied to a binary's code signature. With an Apple Development
 identity present, `install.sh` signs every helper with a stable

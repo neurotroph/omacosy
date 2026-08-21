@@ -15,6 +15,26 @@ STATE_DIR="$HOME/.local/state/omacosy"
 MANIFEST="$STATE_DIR/manifest"
 mkdir -p "$STATE_DIR"
 touch "$MANIFEST"
+
+# Runtime files — logs, IPC pokes, pidfiles, the spawn lock — live
+# here, mode 700. They used to live in /tmp, which is world-writable:
+# every one of those names was predictable, so any other local uid
+# could plant a symlink at one and have a daemon (or launchd, opening
+# a StandardErrorPath) write through it. Each daemon creates this
+# directory itself; it is created here too because launchd opens the
+# agents' stderr before the process it belongs to ever runs.
+RUN_DIR="$STATE_DIR/run"
+mkdir -p "$RUN_DIR"
+chmod 700 "$RUN_DIR"
+# leftovers from the /tmp era. `rm -f` unlinks a planted symlink
+# rather than following it, and the sticky bit makes another user's
+# file simply refuse to go — neither is worth failing the install for.
+rm -f /tmp/omacosy-*.log /tmp/omacosy-*.err /tmp/omacosy-bar-ws \
+  /tmp/omacosy-bar-moved /tmp/omacosy-bar-cheatsheet /tmp/omacosy-ws-switch \
+  "/tmp/omacosy-overview-$(id -u).pid" "/tmp/omacosy-overlay-active-$(id -u)" \
+  "/tmp/omacosy-user-intent-$(id -u)" "/tmp/omacosy-split-state-$(id -u)" \
+  "/tmp/omacosy-guard-bounce-$(id -u)" "/tmp/omacosy-guard-cooldown-$(id -u)" 2>/dev/null || true
+rmdir "/tmp/omacosy-spawn-$(id -u).lock.d" 2>/dev/null || true
 mark() { grep -qxF "$1" "$MANIFEST" || printf '%s\n' "$1" >> "$MANIFEST"; }
 have() { grep -qxF "$1" "$MANIFEST" 2>/dev/null; }
 export MANIFEST
@@ -296,7 +316,7 @@ cat > "$HOME/Library/LaunchAgents/com.omacosy.ffm.plist" <<PLIST
   <key>ProgramArguments</key><array><string>$HOME/.local/bin/omacosy-ffm</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardErrorPath</key><string>/tmp/omacosy-ffm.err</string>
+  <key>StandardErrorPath</key><string>$RUN_DIR/ffm.err</string>
 </dict>
 </plist>
 PLIST
@@ -318,7 +338,7 @@ cat > "$HOME/Library/LaunchAgents/com.omacosy.bar.plist" <<PLIST
        is responsible for itself and may prompt, and this marker is how it
        knows the difference. -->
   <key>EnvironmentVariables</key><dict><key>OMACOSY_MANAGED</key><string>1</string></dict>
-  <key>StandardErrorPath</key><string>/tmp/omacosy-bar.err</string>
+  <key>StandardErrorPath</key><string>$RUN_DIR/bar.err</string>
 </dict>
 </plist>
 PLIST

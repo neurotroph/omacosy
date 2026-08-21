@@ -12,10 +12,15 @@ pick() { # monitor-id, slot -> that monitor's workspace ending in slot
     | awk -v s="$2" 'substr($0, length($0)) == s { print; exit }'
 }
 
+# Runtime files live under ~/.local/state (mode 700), not /tmp: a
+# world-writable directory lets any other local uid plant a symlink at
+# a predictable name and redirect the write.
+RUN="$HOME/.local/state/omacosy/run"
+
 # A window moved between two HIDDEN workspaces changes nothing on
 # screen, so the window server has no event to give the bar and its
 # workspace icons would sit stale. Builtin redirect, no extra process.
-moved() { : > /tmp/omacosy-bar-moved; }
+moved() { mkdir -p "$RUN" && : > "$RUN/bar-moved"; }
 
 mon="$("$A" list-monitors --focused --format '%{monitor-id}')"
 case "$op" in

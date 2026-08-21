@@ -249,7 +249,19 @@ guard AXIsProcessTrustedWithOptions(
 // cursor and either focus (dwell confirmed) or arm the dwell timer.
 // The timer path exists because events stop when the cursor stops —
 // "glide into a window and rest" must still confirm ~100ms later.
-let overlayFlag = "/tmp/omacosy-overlay-active-\(getuid())"
+// Runtime files live under ~/.local/state (mode 700), never in /tmp:
+// a world-writable directory means any other local uid can plant a
+// symlink at one of these predictable names and have this process
+// write through it.
+let runDir: String = {
+    let d = "\(NSHomeDirectory())/.local/state/omacosy/run"
+    try? FileManager.default.createDirectory(
+        atPath: d, withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700])
+    return d
+}()
+
+let overlayFlag = "\(runDir)/overlay-active"
 
 func process(confirmed: Bool) {
     // the workspace overview is up: it holds key focus deliberately,
@@ -293,7 +305,7 @@ func process(confirmed: Bool) {
             // change) gets bounced as an "app yank", warping the
             // cursor back via aerospace's move-mouse hook
             FileManager.default.createFile(
-                atPath: "/tmp/omacosy-user-intent-\(getuid())", contents: nil)
+                atPath: "\(runDir)/user-intent", contents: nil)
             slpsFocus(pid: hit.pid, wid: hit.wid, raise: !hit.covered)
             focus(pid: hit.pid, rect: hit.rect, allowRaise: !hit.covered)
             lastFocusAt = now

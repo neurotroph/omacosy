@@ -15,7 +15,7 @@
 // draw one frame. The slow path (which windows exist, where) runs only
 // on window create/destroy, off the critical path.
 //
-// Timings land in /tmp/omacosy-bar.log as `switch <ws> <ms>`.
+// Timings land in ~/.local/state/omacosy/run/bar.log as `switch <ws> <ms>`.
 //
 // The right cluster is the same eight pills the bar already carries, but
 // reading their sources directly instead of forking a script that forks
@@ -97,7 +97,20 @@ func aerospace(_ args: [String]) -> String {
     return String(data: data, encoding: .utf8) ?? ""
 }
 
-let logURL = URL(fileURLWithPath: "/tmp/omacosy-bar.log")
+// Runtime files — logs, IPC pokes, cached state — live under
+// ~/.local/state (mode 700), never in /tmp. A world-writable directory
+// means any other local uid can plant a symlink at one of these
+// predictable names and have this daemon write through it; the uid
+// suffix some of them used to carry made the name unique, not private.
+let runDir: String = {
+    let d = "\(NSHomeDirectory())/.local/state/omacosy/run"
+    try? FileManager.default.createDirectory(
+        atPath: d, withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700])
+    return d
+}()
+
+let logURL = URL(fileURLWithPath: "\(runDir)/bar.log")
 func tlog(_ m: String) {
     let line = "\(Date()) \(m)\n"
     if let h = try? FileHandle(forWritingTo: logURL) {
@@ -1455,7 +1468,7 @@ func prettyKey(_ raw: String) -> String {
 func prettyAction(_ raw: String) -> String {
     var s = raw
     // the binary's directory AND its omacosy- prefix go together: doing
-    // them separately rewrote /tmp/omacosy-bar-cheatsheet into a path
+    // them separately rewrote the cheatsheet poke path into one
     // that does not exist, which is worse than the noise
     for noise in ["exec-and-forget ", "\(NSHomeDirectory())/.local/bin/omacosy-",
                   "$HOME/.local/bin/omacosy-", "\(NSHomeDirectory())/.local/bin/",
@@ -2300,16 +2313,16 @@ func watch(_ path: String, create: Bool, handler: @escaping () -> Void) {
 // No publisher exists for it, so the commands that do the moving say so
 // themselves (omacosy-ws, and the overview's drag-reorder).
 // Super+K writes this; the bar has no key tap and should not grow one
-let cheatPath = "/tmp/omacosy-bar-cheatsheet"
+let cheatPath = "\(runDir)/bar-cheatsheet"
 watch(cheatPath, create: true) { toggleCheatsheet() }
 
-let movedPath = "/tmp/omacosy-bar-moved"
+let movedPath = "\(runDir)/bar-moved"
 watch(movedPath, create: true) {
     tlog("moved poke")
     kickRebuild()
 }
 
-let wsPath = "/tmp/omacosy-bar-ws"
+let wsPath = "\(runDir)/bar-ws"
 watch(wsPath, create: true) {
     let t0 = DispatchTime.now().uptimeNanoseconds
     guard let text = try? String(contentsOfFile: wsPath, encoding: .utf8) else { return }

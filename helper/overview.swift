@@ -65,10 +65,22 @@ func rememberFront() {
     previousFront = nil
 }
 
-let pidPath = "/tmp/omacosy-overview-\(getuid()).pid"
+// Runtime files live under ~/.local/state (mode 700), never in /tmp:
+// a world-writable directory means any other local uid can plant a
+// symlink at one of these predictable names and have this process
+// write through it.
+let runDir: String = {
+    let d = "\(NSHomeDirectory())/.local/state/omacosy/run"
+    try? FileManager.default.createDirectory(
+        atPath: d, withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700])
+    return d
+}()
+
+let pidPath = "\(runDir)/overview.pid"
 // raised while the overlay is on screen — omacosy-ffm stands down so
 // hover-focus can't steal key from under the user's click
-let activeFlag = "/tmp/omacosy-overlay-active-\(getuid())"
+let activeFlag = "\(runDir)/overlay-active"
 let isDaemon = CommandLine.arguments.contains("--daemon")
 let showOnLaunch = CommandLine.arguments.contains("--show")
 
@@ -109,7 +121,7 @@ signal(SIGTERM) { _ in
 signal(SIGUSR1, SIG_IGN) // delivered via DispatchSource below
 signal(SIGUSR2, SIG_IGN)
 
-let logURL = URL(fileURLWithPath: "/tmp/omacosy-overview.log")
+let logURL = URL(fileURLWithPath: "\(runDir)/overview.log")
 func tlog(_ m: String) {
     let line = "\(Date()) \(m)\n"
     if let h = try? FileHandle(forWritingTo: logURL) {
@@ -443,7 +455,7 @@ func reorderWorkspaces(from slots: [String], to order: [String]) {
         }
         // a rotation between hidden workspaces moves nothing on screen,
         // so the bar's workspace icons have no event to learn from
-        FileManager.default.createFile(atPath: "/tmp/omacosy-bar-moved", contents: nil)
+        FileManager.default.createFile(atPath: "\(runDir)/bar-moved", contents: nil)
         DispatchQueue.main.async {
             if overlayVisible { // take key back the way showOverlay takes it
                 win.makeKeyAndOrderFront(nil)
@@ -606,7 +618,7 @@ final class ContentView: NSView {
     }
     override func keyDown(with event: NSEvent) {
         // the KEYCODE is what debugging needs; the character it produced
-        // is input, and /tmp/omacosy-*.log is world-readable
+        // is input, and a log file outlives the keystroke
         tlog("keyDown code=\(event.keyCode) shown=\(shownIds)")
         if event.keyCode == 53 { hideOverlay(); return } // esc
         if let ch = event.charactersIgnoringModifiers,

@@ -21,7 +21,8 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$REPO/docs/screenshots"
 WORK="$(mktemp -d)"
 PARK="$WORK/parked"
-SHEET=/tmp/omacosy-bar-cheatsheet
+RUN="$HOME/.local/state/omacosy/run"
+SHEET="$RUN/bar-cheatsheet"
 A="$(command -v aerospace || echo /opt/homebrew/bin/aerospace)"
 DISPLAY_N=""
 KEEP_PNG=""
@@ -94,7 +95,7 @@ restore() {
     while IFS='	' read -r wid ws; do
       [ -n "$wid" ] && "$A" move-node-to-workspace --window-id "$wid" "$ws" >/dev/null 2>&1 || true
     done < "$PARK"
-    : > /tmp/omacosy-bar-moved
+    : > "$RUN/bar-moved"
   fi
   [ -n "$HOME_WS" ] && "$A" workspace "$HOME_WS" >/dev/null 2>&1 || true
   rm -rf "$WORK"
@@ -246,7 +247,7 @@ for wid in $("$A" list-windows --workspace "$SCRATCH" --format '%{window-id}'); 
   target="$(echo $EMPTY_WS | cut -d' ' -f$n)"
   [ -n "$target" ] && "$A" move-node-to-workspace --window-id "$wid" "$target" >/dev/null 2>&1 || true
 done
-: > /tmp/omacosy-bar-moved
+: > "$RUN/bar-moved"
 sleep 1.5
 
 say "opening the overview"

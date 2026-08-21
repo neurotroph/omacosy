@@ -14,11 +14,15 @@
 # can never wedge the terminal key.
 APP="$1"
 [ -n "$APP" ] || exit 1
-STATE="/tmp/omacosy-split-state-$(id -u)"
+# ~/.local/state (mode 700), not /tmp — a world-writable directory
+# lets another local uid plant a symlink at a predictable name.
+RUN="$HOME/.local/state/omacosy/run"
+mkdir -p "$RUN"
+STATE="$RUN/split-state"
 
 # macOS ships no flock; mkdir is the portable atomic lock. A holder
 # that died is stolen after ~5s so the terminal key can never go dead.
-LOCK="/tmp/omacosy-spawn-$(id -u).lock.d"
+LOCK="$RUN/spawn.lock.d"
 for i in $(seq 120); do
   mkdir "$LOCK" 2>/dev/null && break
   [ "$i" -ge 100 ] && { rm -rf "$LOCK"; }
