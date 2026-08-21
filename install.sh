@@ -69,9 +69,11 @@ if ! command -v brew >/dev/null 2>&1; then
   mark "installed-homebrew"
 fi
 
-# Homebrew >=6 refuses third-party taps until explicitly trusted
+# Homebrew >=6 refuses third-party taps until explicitly trusted.
+# Only the taps the Brewfile actually draws from: felixkratz/formulae
+# left with sketchybar, and trusting a tap nothing installs from is
+# standing permission for a future formula nobody chose.
 brew trust nikitabobko/tap 2>/dev/null || true
-brew trust felixkratz/formulae 2>/dev/null || true
 
 log "Installing packages (brew bundle)"
 PRE_FORMULAE="$(brew list --formula 2>/dev/null | sort)"
