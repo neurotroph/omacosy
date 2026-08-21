@@ -389,44 +389,81 @@ fi
 # --- 5. Trackpad workspace swipes (aerospace-swipe) -------------------------
 # Built from source; installs a user launch agent. Config is COPIED (same
 # TCC constraint as Karabiner: launch agents can't read ~/Documents).
-if [ ! -d "$HOME/.local/share/aerospace-swipe" ]; then
-  git clone -q https://github.com/acsandmann/aerospace-swipe.git "$HOME/.local/share/aerospace-swipe"
+SWIPE_DIR="$HOME/.local/share/aerospace-swipe"
+# A PINNED commit, not whatever the default branch says today. This is
+# the most privileged third-party thing the installer builds itself:
+# the result gets Accessibility and Input Monitoring, and is then
+# signed below with your own Apple Development identity so those
+# grants survive every later rebuild. Lending your code identity to a
+# moving target is the part that does not hold up — so the target does
+# not move. Bump this deliberately, after reading the diff, and re-run
+# install.sh; the patches below are verified against exactly this tree.
+SWIPE_COMMIT=16aad5a5ad678335a7593a2afaa473816c278c5f
+
+if [ ! -d "$SWIPE_DIR" ]; then
+  git clone -q https://github.com/acsandmann/aerospace-swipe.git "$SWIPE_DIR"
   mark "cloned-aerospace-swipe"
 fi
-# macOS 26 fix: read raw MultitouchSupport frames on all devices —
-# event taps no longer carry multi-touch data on 26.3
-if git -C "$HOME/.local/share/aerospace-swipe" apply --check "$REPO_DIR/patches/aerospace-swipe-macos26-raw-multitouch.patch" 2>/dev/null; then
-  git -C "$HOME/.local/share/aerospace-swipe" apply "$REPO_DIR/patches/aerospace-swipe-macos26-raw-multitouch.patch"
+
+# The three patches go onto a KNOWN tree.
+#
+#   - macos26-raw-multitouch: read raw MultitouchSupport frames on all
+#     devices — event taps no longer carry multi-touch data on 26.3.
+#   - socket-recovery: one socket timeout used to strand the client in
+#     CLI mode for the whole session, and that CLI mode ran a bare
+#     `aerospace` a launch agent's PATH cannot resolve, so every swipe
+#     after plugging in a display silently did nothing.
+#   - wake-reregister: the built-in trackpad keeps its IOService across
+#     sleep, so no HID-attach fires, but the multitouch callback
+#     session can die anyway — swipes were dead after wake until a
+#     real hotplug.
+#
+# They are ORDERED (wake-reregister patches code the first one adds),
+# so applying "whichever ones still fit" is not a thing: a clone we
+# made holds nothing but upstream plus these patches, which makes
+# checking the pin back out exactly the same as un-applying them.
+# Every run then rebuilds the same stack from the same base. A clone
+# the user brought themselves is never reset — only what still applies
+# goes on, as before.
+apply_swipe_patches() {
+  for p in macos26-raw-multitouch socket-recovery wake-reregister; do
+    git -C "$SWIPE_DIR" apply "$REPO_DIR/patches/aerospace-swipe-$p.patch" ||
+      log "WARNING: patch $p did not apply — swipe gestures may misbehave"
+  done
+}
+if have "cloned-aerospace-swipe"; then
+  if ! git -C "$SWIPE_DIR" cat-file -e "$SWIPE_COMMIT^{commit}" 2>/dev/null; then
+    git -C "$SWIPE_DIR" fetch -q origin 2>/dev/null || true
+  fi
+  if git -C "$SWIPE_DIR" checkout -q --force --detach "$SWIPE_COMMIT" 2>/dev/null; then
+    apply_swipe_patches
+  else
+    log "WARNING: could not check out aerospace-swipe $SWIPE_COMMIT."
+    log "  Leaving the clone as it is — swipes keep whatever build they had."
+  fi
+else
+  for p in macos26-raw-multitouch socket-recovery wake-reregister; do
+    if git -C "$SWIPE_DIR" apply --check "$REPO_DIR/patches/aerospace-swipe-$p.patch" 2>/dev/null; then
+      git -C "$SWIPE_DIR" apply "$REPO_DIR/patches/aerospace-swipe-$p.patch"
+    fi
+  done
 fi
-# docking fix: one socket timeout used to strand the client in CLI mode
-# for the whole session, and that CLI mode ran a bare `aerospace` a
-# launch agent's PATH cannot resolve — so every swipe after plugging in
-# a display silently did nothing. Retry the socket, resolve the binary.
-if git -C "$HOME/.local/share/aerospace-swipe" apply --check "$REPO_DIR/patches/aerospace-swipe-socket-recovery.patch" 2>/dev/null; then
-  git -C "$HOME/.local/share/aerospace-swipe" apply "$REPO_DIR/patches/aerospace-swipe-socket-recovery.patch"
-fi
-# sleep/wake is the one hotplug IOKit does not announce: the built-in
-# trackpad keeps its IOService across sleep, so no HID-attach fires,
-# but the multitouch callback session can die anyway — swipes were
-# silently dead after wake until a real hotplug. Re-register on wake.
-if git -C "$HOME/.local/share/aerospace-swipe" apply --check "$REPO_DIR/patches/aerospace-swipe-wake-reregister.patch" 2>/dev/null; then
-  git -C "$HOME/.local/share/aerospace-swipe" apply "$REPO_DIR/patches/aerospace-swipe-wake-reregister.patch"
-fi
+
 mkdir -p "$HOME/.config/aerospace-swipe"
 cp "$REPO_DIR/config/aerospace-swipe/config.json" "$HOME/.config/aerospace-swipe/config.json"
 log "Building aerospace-swipe (grant Accessibility when prompted)"
 # pre-unload: the makefile ends with launchctl load, which fails on
 # an already-loaded agent and made every re-run print a false failure
 launchctl unload "$HOME/Library/LaunchAgents/com.acsandmann.swipe.plist" 2>/dev/null || true
-(cd "$HOME/.local/share/aerospace-swipe" && make install) || \
+(cd "$SWIPE_DIR" && make install) || \
   echo "aerospace-swipe install failed — run manually: cd ~/.local/share/aerospace-swipe && make install"
 # re-sign with the STABLE identity, and only AFTER make install: the
 # makefile signs ad-hoc, which rotates per rebuild and invalidates
 # the Accessibility grant. Keep the entitlements the makefile applied.
 if security find-identity -p codesigning -v 2>/dev/null | grep -q "Apple Development"; then
   codesign -f -s "Apple Development" --identifier com.acsandmann.swipe \
-    --entitlements "$HOME/.local/share/aerospace-swipe/accessibility.entitlements" \
-    "$HOME/.local/share/aerospace-swipe/AerospaceSwipe.app" 2>/dev/null || true
+    --entitlements "$SWIPE_DIR/accessibility.entitlements" \
+    "$SWIPE_DIR/AerospaceSwipe.app" 2>/dev/null || true
   launchctl kickstart -k "gui/$(id -u)/com.acsandmann.swipe" 2>/dev/null || true
 fi
 

@@ -109,6 +109,14 @@ Refuse the grant and you lose the name, nothing else.
   during install is. It is the most privileged thing this repo puts on
   your Mac, and it is third-party. Skip it if that trade is wrong for
   you; you lose the Super key and keep everything else.
+- **One third-party program is built from source here, at a pinned
+  commit.** aerospace-swipe is compiled by `install.sh`, gets
+  Accessibility and Input Monitoring, and is then signed with your own
+  Apple Development identity so those grants survive rebuilds — which
+  is exactly why the commit is pinned in `install.sh` (`SWIPE_COMMIT`)
+  rather than tracking upstream's default branch. Bumping it is a
+  deliberate edit, and the patches in `patches/` are verified against
+  that tree.
 - **Nothing here reads your keystrokes.** No omacosy binary opens a
   keyboard event tap. Only Karabiner sees keys, which is inherent to
   remapping one. AerospaceSwipe's event tap is gesture-only and
