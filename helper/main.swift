@@ -130,7 +130,17 @@ case "displays":
     }
 
 case "wallpaper":
-    guard args.count > 2 else { fail("usage: wallpaper <path>") }
+    guard args.count > 2 else { fail("usage: wallpaper <path> | wallpaper get") }
+    // `get` prints each screen's current wallpaper path in arrangement
+    // order — install.sh records these so uninstall.sh can put the
+    // pre-omacosy picture back instead of leaving the theme wallpaper
+    // as a souvenir.
+    if args[2] == "get" {
+        for screen in NSScreen.screens.sorted(by: { $0.frame.origin.x < $1.frame.origin.x }) {
+            print(NSWorkspace.shared.desktopImageURL(for: screen)?.path ?? "")
+        }
+        break
+    }
     let url = URL(fileURLWithPath: args[2])
     var failures = 0
     for screen in NSScreen.screens {

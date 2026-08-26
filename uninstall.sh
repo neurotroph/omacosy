@@ -48,7 +48,8 @@ rm -f /tmp/omacosy-*.log /tmp/omacosy-*.err /tmp/omacosy-bar-ws \
   /tmp/omacosy-bar-moved /tmp/omacosy-bar-cheatsheet /tmp/omacosy-ws-switch \
   "/tmp/omacosy-overview-$(id -u).pid" "/tmp/omacosy-overlay-active-$(id -u)" \
   "/tmp/omacosy-user-intent-$(id -u)" "/tmp/omacosy-split-state-$(id -u)" \
-  "/tmp/omacosy-guard-bounce-$(id -u)" "/tmp/omacosy-guard-cooldown-$(id -u)" 2>/dev/null || true
+  "/tmp/omacosy-guard-bounce-$(id -u)" "/tmp/omacosy-guard-cooldown-$(id -u)" \
+  "${TMPDIR:-/tmp}/omacosy-monitor-count" 2>/dev/null || true
 rmdir "/tmp/omacosy-spawn-$(id -u).lock.d" 2>/dev/null || true
 rm -rf "$HOME/.config/omacosy"
 
@@ -113,6 +114,7 @@ grep '^copied-config ' "$MANIFEST" 2>/dev/null | sed 's/^copied-config //' |
 restore "$HOME/.zshrc"
 restore "$HOME/.config/starship.toml"
 restore "$HOME/.config/aerospace"
+restore "$HOME/.config/ghostty"
 
 # re-enable Karabiner's helper agents we disabled
 for agent in Karabiner-Menu Karabiner-NotificationWindow; do
@@ -139,10 +141,32 @@ fi
 
 # theme-set / theme-next out of ~/.local/bin — only when they are OUR
 # symlinks (a user's own script of the same name survives)
-for t in theme-set theme-next omacosy-ws omacosy-toggle omacosy-focus-guard omacosy-ws-collapse omacosy-float omacosy-cycle omacosy-update; do
+for t in theme-set theme-next omacosy-ws omacosy-toggle omacosy-focus-guard omacosy-ws-collapse omacosy-float omacosy-cycle omacosy-update omacosy-spawn; do
   target="$(readlink "$HOME/.local/bin/$t" 2>/dev/null || true)"
   case "$target" in *omacosy*) rm -f "$HOME/.local/bin/$t" ;; esac
 done
+
+# Put the pre-omacosy wallpaper back — theme-set overwrote every display
+# and the picture would otherwise stay as a souvenir. Restores only when
+# the CURRENT wallpaper is still one of ours (a picture the user chose
+# since is respected), and only while omacosy-helper still exists, so
+# this must run before the helper is removed below.
+if [ -x "$HOME/.local/bin/omacosy-helper" ] \
+  && grep -q "$(printf '^wallpaper\t')" "$MANIFEST" 2>/dev/null; then
+  CUR_WP="$("$HOME/.local/bin/omacosy-helper" wallpaper get 2>/dev/null | head -1)"
+  case "$CUR_WP" in
+    */omacosy/*|*/omarchy/*|*backgrounds*)
+      PREV_WP="$(grep "$(printf '^wallpaper\t')" "$MANIFEST" | head -1 | cut -f3)"
+      if [ -n "$PREV_WP" ] && [ -e "$PREV_WP" ]; then
+        log "Restoring the pre-omacosy wallpaper"
+        "$HOME/.local/bin/omacosy-helper" wallpaper "$PREV_WP" 2>/dev/null || true
+        if [ "$(grep -c "$(printf '^wallpaper\t')" "$MANIFEST")" -gt 1 ]; then
+          log "  (you had different wallpapers per display — only one could be restored)"
+        fi
+      fi
+      ;;
+  esac
+fi
 rm -f "$HOME/.local/bin/omacosy-helper"
 
 # omarchy theme convention dirs (restore brings back any .bak the
@@ -183,5 +207,10 @@ Done. Left in place on purpose:
   - Claude desktop's caps-lock dictation shortcut was removed during setup;
     re-enable it in Claude's settings if you used it.
   - If AeroSpace still appears in System Settings -> General -> Login Items, remove it there.
+  - Permission entries (Accessibility, Input Monitoring, Screen Recording,
+    Location, Bluetooth) stay listed in System Settings -> Privacy &
+    Security — macOS lets no script remove them. The binaries they named
+    are gone, so the entries are inert; delete them there if you want the
+    lists clean.
   - The repo itself and your shell tools (fzf, eza, zoxide, ...) are untouched.
 EOF
