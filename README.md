@@ -275,6 +275,7 @@ typing or app shortcuts. Caps Lock tapped alone is Escape.
 | `Super+space` | launcher (Raycast) |
 | `Super+shift+f` / `+m` / `+g` | files / music / messenger (set in `apps.conf`) |
 | `Super+shift+t` | next theme |
+| `Super+shift+b` | next wallpaper of the current theme |
 | `Super+shift+l` | lock the screen |
 | `Super+k` | keybinding cheatsheet (this table, rendered from the config) |
 
@@ -315,6 +316,11 @@ individually, so anything you opened while undocked stays put.
 on every display, and any terminal that follows omarchy's
 `~/.config/omarchy/current/theme` convention (the author's does).
 `Super+Shift+T` cycles.
+
+Each theme ships omarchy's full wallpaper set. `Super+Shift+B` (or
+`theme-bg-next`) cycles through them; `theme-bg-next <path>` sets any
+image you like. Switching themes restarts at the theme's first
+wallpaper.
 
 Themes: `tokyo-night`, `catppuccin`, `gruvbox`, `osaka-jade`. Each
 `themes/<name>/` holds `colors.toml` (omarchy's 22-color palette),

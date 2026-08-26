@@ -30,8 +30,12 @@ rm -rf "$HOME/.local/share/omacosy/omacosy-bar.app"
 # overview is self-daemonizing (no launchd agent) — kill by pidfile.
 # It lives in the mode-700 runtime dir now, but the -L check stays:
 # `[ -f ]` follows symlinks, and trusting the contents no further than
-# "digits" costs nothing.
+# "digits" costs nothing. Older installs kept the pidfile one level up,
+# and older ones still in /tmp — fall back through both, or an upgrade
+# leaves its running daemon alive with its pidfile deleted under it.
 PIDFILE="$HOME/.local/state/omacosy/run/overview.pid"
+[ -f "$PIDFILE" ] || PIDFILE="$HOME/.local/state/omacosy/overview.pid"
+[ -f "$PIDFILE" ] || PIDFILE="/tmp/omacosy-overview-$(id -u).pid"
 if [ -f "$PIDFILE" ] && [ ! -L "$PIDFILE" ]; then
   OVERVIEW_PID="$(cat "$PIDFILE" 2>/dev/null || true)"
   case "$OVERVIEW_PID" in
@@ -141,7 +145,7 @@ fi
 
 # theme-set / theme-next out of ~/.local/bin — only when they are OUR
 # symlinks (a user's own script of the same name survives)
-for t in theme-set theme-next omacosy-ws omacosy-toggle omacosy-focus-guard omacosy-ws-collapse omacosy-float omacosy-cycle omacosy-update omacosy-spawn; do
+for t in theme-set theme-next theme-bg-next omacosy-ws omacosy-toggle omacosy-focus-guard omacosy-ws-collapse omacosy-float omacosy-cycle omacosy-update omacosy-spawn omacosy-layout; do
   target="$(readlink "$HOME/.local/bin/$t" 2>/dev/null || true)"
   case "$target" in *omacosy*) rm -f "$HOME/.local/bin/$t" ;; esac
 done

@@ -354,12 +354,14 @@ launchctl unload "$HOME/Library/LaunchAgents/com.omacosy.bar.plist" 2>/dev/null 
 launchctl load "$HOME/Library/LaunchAgents/com.omacosy.bar.plist"
 link "$REPO_DIR/bin/theme-set"  "$HOME/.local/bin/theme-set"
 link "$REPO_DIR/bin/theme-next" "$HOME/.local/bin/theme-next"
+link "$REPO_DIR/bin/theme-bg-next" "$HOME/.local/bin/theme-bg-next"
 link "$REPO_DIR/bin/omacosy-toggle" "$HOME/.local/bin/omacosy-toggle"
 link "$REPO_DIR/bin/omacosy-ws" "$HOME/.local/bin/omacosy-ws"
 link "$REPO_DIR/bin/omacosy-focus-guard" "$HOME/.local/bin/omacosy-focus-guard"
 link "$REPO_DIR/bin/omacosy-ws-collapse" "$HOME/.local/bin/omacosy-ws-collapse"
 link "$REPO_DIR/bin/omacosy-update" "$HOME/.local/bin/omacosy-update"
 link "$REPO_DIR/bin/omacosy-spawn" "$HOME/.local/bin/omacosy-spawn"
+link "$REPO_DIR/bin/omacosy-layout" "$HOME/.local/bin/omacosy-layout"
 link "$REPO_DIR/bin/omacosy-float" "$HOME/.local/bin/omacosy-float"
 link "$REPO_DIR/bin/omacosy-cycle" "$HOME/.local/bin/omacosy-cycle"
 
@@ -532,6 +534,11 @@ fi
 
 log "Starting AeroSpace"
 open -a AeroSpace
+# an ALREADY-running AeroSpace does not re-read its config on `open` —
+# without this, updates that change keybindings or rules look applied
+# but are not until the next restart
+sleep 1
+"$(command -v aerospace || echo /opt/homebrew/bin/aerospace)" reload-config 2>/dev/null || true
 
 # The remapping runs in launchd-managed services; the app itself is only
 # the settings window, and it costs ~92MB resident to leave open. Launch

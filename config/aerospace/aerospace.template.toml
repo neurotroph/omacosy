@@ -124,15 +124,17 @@ cmd-ctrl-alt-k = 'exec-and-forget /usr/bin/touch $HOME/.local/state/omacosy/run/
 # focus next and cannot be pinned on top without a private window-level
 # call; this is how you get it back, cursor and all.
 cmd-ctrl-alt-s = 'exec-and-forget $HOME/.local/bin/omacosy-float'
-cmd-ctrl-alt-j = 'layout tiles horizontal vertical'
+# wrapper-aware: the dwindle hint's solo container makes the bare
+# commands no-op or misfire (issue #3) — omacosy-layout compensates
+cmd-ctrl-alt-j = 'exec-and-forget $HOME/.local/bin/omacosy-layout togglesplit'
 cmd-ctrl-alt-f = 'fullscreen --no-outer-gaps'
 # native (green-button) fullscreen: the only mode that may claim the
 # notch strip on the built-in display; deliberate enter/exit only
 cmd-ctrl-alt-n = 'macos-native-fullscreen'
 
 # Resize (omarchy: Super+Minus / Super+Equal)
-cmd-ctrl-alt-minus = 'resize smart -50'
-cmd-ctrl-alt-equal = 'resize smart +50'
+cmd-ctrl-alt-minus = 'exec-and-forget $HOME/.local/bin/omacosy-layout resize -50'
+cmd-ctrl-alt-equal = 'exec-and-forget $HOME/.local/bin/omacosy-layout resize +50'
 
 # Workspaces (omarchy: Super+N, Super+Shift+N, Super+Tab)
 cmd-ctrl-alt-1 = 'exec-and-forget $HOME/.local/bin/omacosy-ws 1'
@@ -199,6 +201,7 @@ cmd-ctrl-alt-shift-l = 'exec-and-forget $HOME/.local/bin/omacosy-helper lock'
 # Theme cycle
 # T for theme; float lives on plain Super+T
 cmd-ctrl-alt-shift-t = 'exec-and-forget $HOME/.local/bin/theme-next'
+cmd-ctrl-alt-shift-b = 'exec-and-forget $HOME/.local/bin/theme-bg-next'
 
 # Modes
 cmd-ctrl-alt-r = 'mode resize'

@@ -46,6 +46,10 @@ fi
 # silently keep the old picture); osascript remains as fallback.
 WALL="$(ls "$THEMES_DIR/$NAME"/backgrounds/* 2>/dev/null | head -1)"
 if [ -n "$WALL" ]; then
+  # theme-bg-next cycles through the rest; a theme switch restarts the
+  # cycle at the first image, so the remembered position moves with it
+  mkdir -p "$HOME/.local/state/omacosy"
+  ln -nsf "$WALL" "$HOME/.local/state/omacosy/background"
   if [ -x "$HOME/.local/bin/omacosy-helper" ]; then
     "$HOME/.local/bin/omacosy-helper" wallpaper "$WALL" >/dev/null 2>&1 || true
   else

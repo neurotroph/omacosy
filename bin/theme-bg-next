@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# theme-bg-next [path] — cycle the current theme's wallpapers, omarchy's
+# omarchy-theme-bg-next for macOS. With a path argument, set exactly
+# that image instead of cycling.
+#
+# The chosen background is remembered as a symlink in the omacosy state
+# dir (NOT /tmp — macOS purges idle /tmp files after ~3 days), so the
+# cycle continues where it left off. theme-set repoints the link when
+# the theme changes.
+set -euo pipefail
+
+CURRENT_THEME="$HOME/.config/omarchy/current/theme"
+STATE_DIR="$HOME/.local/state/omacosy"
+LINK="$STATE_DIR/background"
+mkdir -p "$STATE_DIR"
+
+set_bg() {
+  ln -nsf "$1" "$LINK"
+  if [ -x "$HOME/.local/bin/omacosy-helper" ]; then
+    "$HOME/.local/bin/omacosy-helper" wallpaper "$1" >/dev/null 2>&1 || true
+  else
+    # argument, not spliced text — a theme is third-party content and a
+    # crafted filename could otherwise close the AppleScript string
+    osascript - "$1" >/dev/null 2>&1 <<'APPLESCRIPT' || true
+on run argv
+  tell application "System Events" to tell every desktop to set picture to (item 1 of argv)
+end run
+APPLESCRIPT
+  fi
+}
+
+if [ $# -gt 0 ]; then
+  [ -f "$1" ] || { echo "no such image: $1" >&2; exit 1; }
+  set_bg "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+  exit 0
+fi
+
+# the sorted background list of the CURRENT theme (numbered filenames
+# define the order, same convention as omarchy's packs)
+BACKGROUNDS=()
+while IFS= read -r f; do BACKGROUNDS+=("$f"); done < <(
+  find -L "$CURRENT_THEME/backgrounds" -maxdepth 1 -type f \
+    \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' -o -iname '*.heic' \) \
+    2>/dev/null | sort
+)
+[ "${#BACKGROUNDS[@]}" -gt 0 ] || { echo "theme has no backgrounds" >&2; exit 1; }
+
+CURRENT="$(readlink "$LINK" 2>/dev/null || true)"
+NEXT="${BACKGROUNDS[0]}"
+for i in "${!BACKGROUNDS[@]}"; do
+  if [ "${BACKGROUNDS[$i]}" = "$CURRENT" ]; then
+    NEXT="${BACKGROUNDS[$(( (i + 1) % ${#BACKGROUNDS[@]} ))]}"
+    break
+  fi
+done
+set_bg "$NEXT"

@@ -65,10 +65,14 @@ func rememberFront() {
     previousFront = nil
 }
 
-// Runtime files live under ~/.local/state (mode 700), never in /tmp:
-// a world-writable directory means any other local uid can plant a
-// symlink at one of these predictable names and have this process
-// write through it.
+// Runtime files live under ~/.local/state (mode 700), never in /tmp,
+// for two independent reasons. /tmp is world-writable, so any other
+// local uid can plant a symlink at one of these predictable names and
+// have this process write through it. And macOS purges /tmp files left
+// untouched for ~3 days, which made an idle daemon's pidfile vanish:
+// the next swipe found none, spawned a second daemon, and the first
+// ran its capture pipeline as an orphan forever (found at load average
+// 190 after six days).
 let runDir: String = {
     let d = "\(NSHomeDirectory())/.local/state/omacosy/run"
     try? FileManager.default.createDirectory(
@@ -104,6 +108,27 @@ if !isDaemon {
     exit(0)
 }
 
+// Singleton, enforced by process table rather than trusted to the
+// pidfile: whatever raced or aged the pidfile away, a second daemon
+// must not survive alongside the first. The NEW daemon wins (it is the
+// one the user's swipe just asked for); every older sibling is killed.
+if let out = try? { () -> String in
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+    p.arguments = ["-f", "omacosy-overview --daemon"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    try p.run()
+    let d = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return String(data: d, encoding: .utf8) ?? ""
+}() {
+    for line in out.split(separator: "\n") {
+        if let pid = pid_t(line.trimmingCharacters(in: .whitespaces)), pid != getpid() {
+            kill(pid, SIGTERM)
+        }
+    }
+}
 try? "\(getpid())".write(toFile: pidPath, atomically: true, encoding: .utf8)
 // a previous instance that died visible leaves the truce flag up,
 // which silently disables ffm and dwindle — this daemon owns the
