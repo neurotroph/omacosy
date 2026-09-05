@@ -45,8 +45,8 @@ decides it:
 
 ## The honest cost ledger (design B's tax)
 
-- Trackpad swipes are a daemon (aerospace-swipe + a raw-multitouch
-  patch), and daemons have Accessibility grants that die whenever the
+- Trackpad swipes are a daemon (`omacosy-gesture`, absorbed from
+  aerospace-swipe), and daemons have Accessibility grants that die whenever the
   binary changes unsigned. Fixed by signing all helpers with a stable
   identity in install.sh — grants now survive rebuilds.
 - Native-fullscreen apps live on their own Space, outside AeroSpace's

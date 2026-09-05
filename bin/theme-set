@@ -70,4 +70,27 @@ fi
 # (kqueue on ~/.config/omarchy/current), so the symlink swap above IS
 # the notification
 
+# OmniWM draws the focus border while it is the window manager (our
+# ring clips at screen edges there — no outer gaps). Its color lives in
+# settings.toml as 0-1 floats; write the theme's ACTIVE_COLOR
+# (0xAARRGGBB) into it — OmniWM live-reloads, so this recolors at once.
+OMNIWM_SETTINGS="$HOME/.config/omniwm/settings.toml"
+if [ -f "$OMNIWM_SETTINGS" ] && [ -f "$THEMES_DIR/$NAME/borders.sh" ]; then
+  ACTIVE="$(grep -o 'ACTIVE_COLOR=0x[0-9a-fA-F]*' "$THEMES_DIR/$NAME/borders.sh" | head -1 | cut -d= -f2)"
+  if [ -n "$ACTIVE" ]; then
+    python3 - "$OMNIWM_SETTINGS" "$ACTIVE" <<'PY'
+import re, sys
+path, argb = sys.argv[1], sys.argv[2]
+v = int(argb, 16)
+r, g, b = (v >> 16 & 0xFF) / 255, (v >> 8 & 0xFF) / 255, (v & 0xFF) / 255
+t = open(path).read()
+sec = re.search(r'\[borders\.color\]\n(?:[a-z]+ = [0-9.]+\n)+', t)
+if sec:
+    new = f"[borders.color]\nalpha = 1.0\nblue = {b}\ngreen = {g}\nred = {r}\n"
+    t = t[:sec.start()] + new + t[sec.end():]
+    open(path, 'w').write(t)
+PY
+  fi
+fi
+
 echo "theme: $NAME"

@@ -1,8 +1,9 @@
 // omacosy-overview — the workspace overview Mission Control can't be.
-// AeroSpace workspaces aren't Spaces, so MC shows one undifferentiated
-// window pile; this overlay asks AeroSpace itself and draws a card per
-// non-empty workspace with LIVE window previews (ScreenCaptureKit —
-// captures work even for AeroSpace's offscreen-stashed windows),
+// AeroSpace/OmniWM workspaces aren't Spaces, so MC shows one
+// undifferentiated window pile; this overlay asks the running window
+// manager itself (AeroSpace CLI or OmniWM IPC, decided per use) and
+// draws a card per non-empty workspace with LIVE window previews
+// (ScreenCaptureKit — captures work even for offscreen-stashed windows),
 // composed into an approximated tile layout. Click a card or press its
 // digit to switch; Esc, backdrop click, losing key, or swiping up
 // again hides it.
@@ -176,11 +177,114 @@ func aerospace(_ args: [String]) -> String {
     return String(data: data, encoding: .utf8) ?? ""
 }
 
+// --- omniwm --------------------------------------------------------------
+
+// The OTHER window manager. omacosy-wm-switch can hand the session from
+// AeroSpace to OmniWM (and back) while this daemon runs, so which one is
+// asked is decided per use, never cached: the running-app check is an
+// in-process lookup, cheap enough to be the whole detection.
+let omniwmBundleID = "com.barut.OmniWM"
+
+func omniwmActive() -> Bool {
+    !NSRunningApplication.runningApplications(withBundleIdentifier: omniwmBundleID).isEmpty
+}
+
+let omniwmctlBin = ["/opt/homebrew/bin/omniwmctl",
+                    "/Applications/OmniWM.app/Contents/MacOS/omniwmctl"]
+    .first { FileManager.default.isExecutableFile(atPath: $0) } ?? "omniwmctl"
+
+@discardableResult
+func omniwmctl(_ args: [String]) -> String {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: omniwmctlBin)
+    p.arguments = args
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return "" }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return String(data: data, encoding: .utf8) ?? ""
+}
+
+// exec a binary at an absolute path, stdout back (the omniQuery fast path)
+func shellOut(_ bin: String, _ args: [String]) -> String {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: bin)
+    p.arguments = args
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return "" }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return String(data: data, encoding: .utf8) ?? ""
+}
+
+// One query, unwrapped to its payload. The CLI prints the whole
+// IPCResponse envelope; everything the overview wants lives two levels
+// down at result.payload (bar.swift's helper, duplicated by the repo's
+// helper-binary convention).
+func omniQuery(_ name: String, _ args: [String] = []) -> [String: Any]? {
+    // fast path: omacosy-omni holds a persistent socket and launches in
+    // ~3 ms where omniwmctl (Swift) needs ~10; it speaks `query <name>
+    // [fields-csv]` and prints the same envelope. Anything fancier
+    // (selector flags like --focused) stays on omniwmctl.
+    let omni = "\(NSHomeDirectory())/.local/bin/omacosy-omni"
+    var out = ""
+    if FileManager.default.isExecutableFile(atPath: omni),
+       args.isEmpty || (args.count == 2 && args[0] == "--fields") {
+        out = shellOut(omni, args.isEmpty ? ["query", name] : ["query", name, args[1]])
+    }
+    if out.isEmpty {
+        out = omniwmctl(["query", name] + args + ["--format", "json"])
+    }
+    guard let data = out.data(using: .utf8),
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          (root["ok"] as? Bool) == true,
+          let result = root["result"] as? [String: Any]
+    else { return nil }
+    return result["payload"] as? [String: Any]
+}
+
+// OmniWM's window ids are opaque IPC handles, but the capture pipeline
+// and thumb cache key on CGWindowIDs. The handle is
+// ow_ + base64url("sessionToken:pid:windowId") and that windowId IS the
+// CG id — live-verified against the CG window list; upstream calls it an
+// AX id, but _AXUIElementGetWindow hands out CGWindowIDs. A handle that
+// stops decoding costs only the thumbnail: the slot falls back to icons.
+func opaqueCGWindowId(_ opaque: String) -> UInt32 {
+    guard opaque.hasPrefix("ow_") else { return 0 }
+    var b64 = String(opaque.dropFirst(3))
+        .replacingOccurrences(of: "-", with: "+")
+        .replacingOccurrences(of: "_", with: "/")
+    while b64.count % 4 != 0 { b64 += "=" }
+    guard let data = Data(base64Encoded: b64),
+          let decoded = String(data: data, encoding: .utf8),
+          let last = decoded.split(separator: ":").last
+    else { return 0 }
+    return UInt32(last) ?? 0
+}
+
+// --- snapshot (either WM) -------------------------------------------------
+
 struct Win {
-    let id: UInt32
+    let id: UInt32   // CGWindowID — what thumbnails and slpsFocus key on
+    let wmId: String // what the WM's own focus/move commands take
     let app: String
     let title: String
     let bundle: String
+}
+
+// numeric workspace ids first in value order, then names lexically —
+// both WMs share the numbering convention (1-9 main, second set guest)
+func wsLess(_ a: String, _ b: String) -> Bool {
+    switch (Int(a), Int(b)) {
+    case let (x?, y?): return x < y
+    case (.some, nil): return true
+    case (nil, .some): return false
+    default: return a < b
+    }
 }
 
 // aerospace monitor ids follow left-to-right arrangement order, same
@@ -198,7 +302,21 @@ func monitorUnderCursor() -> Int {
     return 1
 }
 
-func snapshotWorkspaces(mon: Int) -> (order: [String], wins: [String: [Win]], focused: String, all: [String]) {
+// the omniwm side of monitorUnderCursor(): OmniWM refs displays by NAME
+// (NSScreen.localizedName — Monitor.current() in its source), joined
+// against `query displays` inside omniwmSnapshot. AppKit coords here,
+// same rule showOverlay uses to pick its screen.
+func cursorScreenName() -> String {
+    let mouse = NSEvent.mouseLocation
+    return (NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main!).localizedName
+}
+
+func snapshotWorkspaces(mon: Int, screenName: String)
+    -> (order: [String], wins: [String: [Win]], focused: String, all: [String]) {
+    omniwmActive() ? omniwmSnapshot(screenName: screenName) : aerospaceSnapshot(mon: mon)
+}
+
+func aerospaceSnapshot(mon: Int) -> (order: [String], wins: [String: [Win]], focused: String, all: [String]) {
     // one CLI round-trip: windows carry their workspace's focused flag
     var wins: [String: [Win]] = [:]
     var focused = ""
@@ -207,7 +325,7 @@ func snapshotWorkspaces(mon: Int) -> (order: [String], wins: [String: [Win]], fo
         .split(separator: "\n") {
         let f = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
         guard f.count >= 6, !f[0].isEmpty, let wid = UInt32(f[1]) else { continue }
-        wins[f[0], default: []].append(Win(id: wid, app: f[2], title: f[3], bundle: f[4]))
+        wins[f[0], default: []].append(Win(id: wid, wmId: f[1], app: f[2], title: f[3], bundle: f[4]))
         if f[5] == "true" { focused = f[0] }
     }
     if focused.isEmpty { // focused workspace holds no windows
@@ -216,14 +334,7 @@ func snapshotWorkspaces(mon: Int) -> (order: [String], wins: [String: [Win]], fo
     }
     var order = Array(wins.keys)
     if !focused.isEmpty, !order.contains(focused) { order.append(focused) }
-    order.sort { a, b in
-        switch (Int(a), Int(b)) {
-        case let (x?, y?): return x < y
-        case (.some, nil): return true
-        case (nil, .some): return false
-        default: return a < b
-        }
-    }
+    order.sort(by: wsLess)
     // per-monitor sets: the overview shows the CURSOR monitor's nine
     // workspaces only (main: 1-9, secondary: 11-19); digits address
     // slots (the name's last digit)
@@ -241,6 +352,95 @@ func snapshotWorkspaces(mon: Int) -> (order: [String], wins: [String: [Win]], fo
     // set's EMPTY workspaces would render as duplicate slot digits in
     // the chip row (11-19 all show their last digit). Same rule as
     // the bar: hide empty guests, keep any that hold windows or focus.
+    if NSScreen.screens.count == 1 {
+        all = all.filter { $0.count == 1 || wins[$0] != nil || $0 == focused }
+    }
+    return (order, wins, focused, all)
+}
+
+// The same snapshot out of omniwmctl, three queries: displays to turn
+// the cursor's screen name into the "display:N" ref the workspace
+// payloads carry, workspaces for sets/visibility/focus, windows for the
+// cards.
+func omniwmSnapshot(screenName: String)
+    -> (order: [String], wins: [String: [Win]], focused: String, all: [String]) {
+    // three IPC round-trips at ~36 ms each: run them CONCURRENTLY so the
+    // cards fill in one round-trip's time, not three (the aerospace
+    // path is a single 30 ms call and this used to feel slower). The
+    // displays query is also the only reliable source for the visible
+    // workspace — the workspaces query's isVisible/isFocused go dark on
+    // EMPTY workspaces (the bar hit the same trap).
+    var displaysP: [String: Any]?
+    var wsP: [String: Any]?
+    var winP: [String: Any]?
+    let group = DispatchGroup()
+    DispatchQueue.global().async(group: group) { displaysP = omniQuery("displays") }
+    DispatchQueue.global().async(group: group) {
+        wsP = omniQuery("workspaces", ["--fields", "raw-name,display"])
+    }
+    DispatchQueue.global().async(group: group) {
+        winP = omniQuery("windows", ["--fields", "id,workspace,app,title"])
+    }
+    group.wait()
+
+    var displayId = ""
+    var focused = "" // the CURRENT display's active workspace
+    var visible = "" // active on THIS monitor
+    if let list = displaysP?["displays"] as? [[String: Any]] {
+        for d in list {
+            let active = (d["activeWorkspace"] as? [String: Any])?["rawName"] as? String ?? ""
+            if (d["name"] as? String) == screenName {
+                displayId = (d["id"] as? String) ?? ""
+                visible = active
+            }
+            if (d["isCurrent"] as? Bool) == true { focused = active }
+        }
+    }
+    var all: [String] = []
+    if let list = wsP?["workspaces"] as? [[String: Any]] {
+        for w in list {
+            guard let name = w["rawName"] as? String,
+                ((w["display"] as? [String: Any])?["id"] as? String) == displayId
+            else { continue }
+            all.append(name)
+        }
+    }
+    all.sort(by: wsLess)
+    var wins: [String: [Win]] = [:]
+    if let list = winP?["windows"] as? [[String: Any]] {
+        for w in list {
+            guard let opaque = w["id"] as? String,
+                let ws = (w["workspace"] as? [String: Any])?["rawName"] as? String
+            else { continue }
+            let app = w["app"] as? [String: Any]
+            // OmniWM 0.6.4 manages our chrome as floating windows
+            // (their hands-off fix is at HEAD, not in the release) —
+            // none of it is a card. The bar has a bundle id; the
+            // overview and helper binaries are unbundled, so the app
+            // NAME prefix is the reliable net (it caught the overview
+            // capturing its own overlay).
+            if (app?["bundleId"] as? String)?.hasPrefix("com.omacosy.") == true { continue }
+            if (app?["name"] as? String)?.hasPrefix("omacosy") == true { continue }
+            // icons want a bundle PATH; the payload carries a bundle id
+            let bundle = ((app?["bundleId"] as? String).flatMap {
+                NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0)?.path }) ?? ""
+            wins[ws, default: []].append(Win(
+                id: opaqueCGWindowId(opaque), wmId: opaque,
+                app: (app?["name"] as? String) ?? "",
+                title: (w["title"] as? String) ?? "", bundle: bundle))
+        }
+    }
+    var order = Array(wins.keys)
+    if !focused.isEmpty, !order.contains(focused) { order.append(focused) }
+    order.sort(by: wsLess)
+    if all.isEmpty { all = order } // display join failed — show everything
+    let monSet = Set(all)
+    for k in wins.keys where !monSet.contains(k) { wins.removeValue(forKey: k) }
+    order = order.filter { monSet.contains($0) }
+    // "you are here" on THIS monitor = its visible workspace
+    if !visible.isEmpty { focused = visible }
+    // single display: hide empty guest-set workspaces, same rule as the
+    // aerospace path (OmniWM's second set is 14-17 here, also multi-char)
     if NSScreen.screens.count == 1 {
         all = all.filter { $0.count == 1 || wins[$0] != nil || $0 == focused }
     }
@@ -431,16 +631,55 @@ func hideOverlay(animated: Bool = true) {
 
 func switchTo(_ ws: String) {
     tlog("switchTo \(ws)")
-    previousFront = nil // aerospace assigns focus; nothing to restore
+    previousFront = nil // the WM assigns focus; nothing to restore
     hideOverlay(animated: false) // switching should snap
     DispatchQueue.global().async {
-        let out = aerospace(["workspace", ws])
-        tlog("aerospace workspace \(ws) -> '\(out.trimmingCharacters(in: .whitespacesAndNewlines))'")
+        if omniwmActive() {
+            // focus-name resolves a numeric raw id across all monitors;
+            // re-focusing the active workspace answers not_found — benign
+            let out = omniwmctl(["workspace", "focus-name", ws])
+            tlog("omniwmctl workspace focus-name \(ws) -> '\(out.trimmingCharacters(in: .whitespacesAndNewlines).prefix(160))'")
+        } else {
+            let out = aerospace(["workspace", ws])
+            tlog("aerospace workspace \(ws) -> '\(out.trimmingCharacters(in: .whitespacesAndNewlines))'")
+        }
     }
 }
 
-// AeroSpace workspaces cannot be renamed or resequenced — the name IS
-// the position. So what a drag reorders is their CONTENT: sliding a
+// Enter with a search up lands ON the matched window, not just its
+// workspace. The WM's own focus primitive does the switching — raising
+// a stashed window via slpsFocus behind the WM's back would desync its
+// workspace model. (slpsFocus still handles plain-dismiss restore; that
+// path is WM-independent and unchanged.)
+func focusWindow(_ w: Win, in ws: String) {
+    tlog("focusWindow \(w.app) on \(ws)")
+    previousFront = nil
+    hideOverlay(animated: false)
+    DispatchQueue.global().async {
+        if omniwmActive() {
+            omniwmctl(["window", "navigate", w.wmId]) // switches workspace if needed
+        } else {
+            // workspace first: the switch must land even if focusing a
+            // just-unhidden window is refused mid-settle
+            _ = aerospace(["workspace", ws])
+            _ = aerospace(["focus", "--window-id", w.wmId])
+        }
+    }
+}
+
+// the omniwm reorder's settle probe: true once the WM reports wid
+// focused (checked first so an already-landed focus costs no sleep)
+func omniFocusSettled(_ wid: String) -> Bool {
+    for _ in 0..<8 {
+        if let w = omniQuery("focused-window")?["window"] as? [String: Any],
+            (w["id"] as? String) == wid { return true }
+        usleep(50_000)
+    }
+    return false
+}
+
+// AeroSpace/OmniWM workspaces cannot be renamed or resequenced — the
+// name IS the position. So what a drag reorders is their CONTENT: sliding a
 // card left rotates the windows through every slot between where it
 // was and where it landed, and the row reads in the dragged order
 // afterwards. `slots` is the row's workspace names in position order,
@@ -464,18 +703,55 @@ func reorderWorkspaces(from slots: [String], to order: [String]) {
         // re-read: the snapshot behind the cards is as old as the
         // overlay, and moving a window id that has since closed is a
         // silent no-op that would leave the row half-rotated
-        var wins: [String: [String]] = [:]
-        for line in aerospace(["list-windows", "--all", "--format",
-            "%{workspace}\t%{window-id}"]).split(separator: "\n") {
-            let f = line.split(separator: "\t").map(String.init)
-            guard f.count == 2 else { continue }
-            wins[f[0], default: []].append(f[1])
-        }
-        // every move reads that ONE snapshot, so a window that lands in
-        // a slot which is itself a source is not picked up twice
-        for (slot, src) in moves {
-            for wid in wins[src] ?? [] {
-                _ = aerospace(["move-node-to-workspace", "--window-id", wid, slot])
+        if omniwmActive() {
+            var wins: [String: [String]] = [:]
+            if let list = omniQuery("windows", ["--fields", "id,workspace"])?["windows"]
+                as? [[String: Any]] {
+                for w in list {
+                    guard let id = w["id"] as? String,
+                        let ws = (w["workspace"] as? [String: Any])?["rawName"] as? String
+                    else { continue }
+                    wins[ws, default: []].append(id)
+                }
+            }
+            // OmniWM has no move-by-id — `command move-to-workspace`
+            // moves whichever window is FOCUSED. Per window: focus it,
+            // poll focused-window until the focus actually landed (AX
+            // focus is async), then move. Best-effort by construction:
+            // `window focus` may refuse a hidden-workspace window, so
+            // `window navigate` (which switches the visible workspace —
+            // expect flips during a rotation through hidden slots) is
+            // the louder fallback, and a window whose focus never
+            // settles even then (~800ms) is SKIPPED and logged — moving
+            // blind would relocate whatever unrelated window holds
+            // focus, scrambling workspaces the drag never touched.
+            for (slot, src) in moves {
+                for wid in wins[src] ?? [] {
+                    omniwmctl(["window", "focus", wid])
+                    if !omniFocusSettled(wid) {
+                        omniwmctl(["window", "navigate", wid])
+                        guard omniFocusSettled(wid) else {
+                            tlog("reorder: focus never landed on \(wid) — skipped")
+                            continue
+                        }
+                    }
+                    omniwmctl(["command", "move-to-workspace", slot])
+                }
+            }
+        } else {
+            var wins: [String: [String]] = [:]
+            for line in aerospace(["list-windows", "--all", "--format",
+                "%{workspace}\t%{window-id}"]).split(separator: "\n") {
+                let f = line.split(separator: "\t").map(String.init)
+                guard f.count == 2 else { continue }
+                wins[f[0], default: []].append(f[1])
+            }
+            // every move reads that ONE snapshot, so a window that lands
+            // in a slot which is itself a source is not picked up twice
+            for (slot, src) in moves {
+                for wid in wins[src] ?? [] {
+                    _ = aerospace(["move-node-to-workspace", "--window-id", wid, slot])
+                }
             }
         }
         // a rotation between hidden workspaces moves nothing on screen,
@@ -501,14 +777,18 @@ func reorderWorkspaces(from slots: [String], to order: [String]) {
 func rebuildCards() {
     guard overlayVisible, let content = win.contentView as? ContentView else { return }
     let mon = monitorUnderCursor()
+    let screenName = cursorScreenName()
     DispatchQueue.global().async {
-        let snap = snapshotWorkspaces(mon: mon)
+        let snap = snapshotWorkspaces(mon: mon, screenName: screenName)
         DispatchQueue.main.async {
             guard overlayVisible, win.contentView === content else { return }
             buildOverlay(snap, into: content)
         }
     }
 }
+
+let defaultHint =
+    "click / 1-9 to switch · drag a card to reorder · esc or swipe down to close"
 
 final class ContentView: NSView {
     // cards are the occupied workspaces in grid order, slots the grid
@@ -517,6 +797,15 @@ final class ContentView: NSView {
     var cardOrder: [String] = []
     var cardSlots: [NSRect] = []
     var cardViews: [String: NSView] = [:]
+    // type-to-search: every card's windows for matching (the +N beyond
+    // the four previews count too), the preview views for dimming, and
+    // the hint line doubling as the query box
+    var filter = ""
+    var cardWins: [String: [Win]] = [:]
+    var slotViews: [String: [(Win, NSView)]] = [:]
+    var hintLabel: NSTextField? = nil
+    var searchPill: NSView? = nil
+    var searchLabel: NSTextField? = nil
     var chipRects: [(NSRect, String)] = [] // empty workspaces: drop targets
     // hover feedback: (rect, ws, view, isChip); focusedWs keeps its ring
     var hoverItems: [(NSRect, String, NSView, Bool)] = []
@@ -641,14 +930,70 @@ final class ContentView: NSView {
             }
         }
     }
+    func matches(_ w: Win) -> Bool {
+        let f = filter.lowercased()
+        return w.app.lowercased().contains(f) || w.title.lowercased().contains(f)
+    }
+    func firstMatch() -> (String, Win)? {
+        for ws in cardOrder {
+            if let w = (cardWins[ws] ?? []).first(where: matches) { return (ws, w) }
+        }
+        return nil
+    }
+    // dim, don't drop: the slot layout is computed once per snapshot and
+    // doubles as the drag hit-geometry (cardSlots/cardViews) — reflowing
+    // it per keystroke would fight the reorder. Non-matching previews
+    // fade, a card with zero matches fades as a whole.
+    func applyFilter() {
+        if filter.isEmpty {
+            for ws in cardOrder {
+                cardViews[ws]?.alphaValue = 1
+                for (_, v) in slotViews[ws] ?? [] { v.alphaValue = 1 }
+            }
+            hintLabel?.stringValue = defaultHint
+            searchLabel?.stringValue = "type to search windows…"
+            searchLabel?.textColor = NSColor(calibratedWhite: 0.45, alpha: 1)
+            searchPill?.layer?.borderColor = NSColor(calibratedWhite: 0.3, alpha: 1).cgColor
+            return
+        }
+        var total = 0
+        for ws in cardOrder {
+            let hits = (cardWins[ws] ?? []).filter(matches).count
+            total += hits
+            cardViews[ws]?.alphaValue = hits == 0 ? 0.3 : 1
+            for (w, v) in slotViews[ws] ?? [] { v.alphaValue = matches(w) ? 1 : 0.25 }
+        }
+        hintLabel?.stringValue = "enter focuses the first match · esc clears"
+        searchLabel?.stringValue = "\(filter)▏  ·  \(total) match\(total == 1 ? "" : "es")"
+        searchLabel?.textColor = NSColor(calibratedWhite: 0.92, alpha: 1)
+        searchPill?.layer?.borderColor = accent.cgColor
+    }
     override func keyDown(with event: NSEvent) {
         // the KEYCODE is what debugging needs; the character it produced
         // is input, and a log file outlives the keystroke
         tlog("keyDown code=\(event.keyCode) shown=\(shownIds)")
-        if event.keyCode == 53 { hideOverlay(); return } // esc
-        if let ch = event.charactersIgnoringModifiers,
-            let ws = allIds.first(where: { $0.hasSuffix(ch) }) {
-            switchTo(ws)
+        switch event.keyCode {
+        case 53: // esc — clear an active search first, close on the second
+            if filter.isEmpty { hideOverlay() } else { filter = ""; applyFilter() }
+        case 51: // backspace
+            if !filter.isEmpty { filter.removeLast(); applyFilter() }
+        case 36, 76: // return — jump INTO the first matching window
+            if !filter.isEmpty, let (ws, w) = firstMatch() { focusWindow(w, in: ws) }
+        default:
+            guard let chars = event.charactersIgnoringModifiers, !chars.isEmpty,
+                !event.modifierFlags.contains(.command),
+                !chars.unicodeScalars.contains(where: {
+                    $0.value < 0x20 || (0xF700...0xF8FF).contains($0.value) })
+            else { return }
+            // digits (or any workspace-suffix key) jump only while the
+            // search is empty, so titles like "2.1.237" stay typeable
+            // once a query has begun
+            if filter.isEmpty, let ws = allIds.first(where: { $0.hasSuffix(chars) }) {
+                switchTo(ws)
+                return
+            }
+            filter += chars
+            applyFilter()
         }
     }
 }
@@ -714,6 +1059,8 @@ func buildOverlay(_ snap: (order: [String], wins: [String: [Win]], focused: Stri
     content.chipRects.removeAll()
     content.hoverItems.removeAll()
     content.hovered = nil
+    content.cardWins.removeAll()
+    content.slotViews.removeAll()
     let screen = win.screen ?? NSScreen.main!
 
     // adaptive card sizing: few workspaces get big readable previews,
@@ -750,6 +1097,7 @@ func buildOverlay(_ snap: (order: [String], wins: [String: [Win]], focused: Stri
         var x = (screen.frame.width - rowW) / 2
         for ws in row {
             let items = wins[ws] ?? []
+            content.cardWins[ws] = items
             let rect = NSRect(x: x, y: y - cardH, width: cardW, height: cardH)
             let card = NSView(frame: rect)
             card.wantsLayer = true
@@ -792,6 +1140,7 @@ func buildOverlay(_ snap: (order: [String], wins: [String: [Win]], focused: Stri
                     sv.layer?.contentsGravity = .center
                 }
                 thumbViews[w.id] = sv
+                content.slotViews[ws, default: []].append((w, sv))
                 card.addSubview(sv)
             }
             if items.count > 4 {
@@ -841,13 +1190,37 @@ func buildOverlay(_ snap: (order: [String], wins: [String: [Win]], focused: Stri
         }
     }
 
-    let hint = label("click / 1-9 to switch · drag a card to reorder · esc or swipe down to close",
+    // the search box, visible from the first frame — an invisible
+    // feature is a missing one. Top-centre, out of the cards' way; the
+    // pill border picks up the accent while a query is live.
+    let pillW: CGFloat = 380, pillH: CGFloat = 34
+    let pill = NSView(frame: NSRect(x: (screen.frame.width - pillW) / 2,
+        y: screen.frame.height - 42 - 18 - pillH, width: pillW, height: pillH))
+    pill.wantsLayer = true
+    pill.layer?.backgroundColor = NSColor(calibratedWhite: 0.09, alpha: 0.92).cgColor
+    pill.layer?.cornerRadius = pillH / 2
+    pill.layer?.borderWidth = 1.5
+    pill.layer?.borderColor = NSColor(calibratedWhite: 0.3, alpha: 1).cgColor
+    let q = label("type to search windows…",
+        size: 13, weight: .medium, color: NSColor(calibratedWhite: 0.45, alpha: 1))
+    q.alignment = .center
+    q.frame = NSRect(x: 12, y: (pillH - 18) / 2, width: pillW - 24, height: 18)
+    pill.addSubview(q)
+    content.cards.addSubview(pill)
+    content.searchPill = pill
+    content.searchLabel = q
+
+    let hint = label(defaultHint,
         size: 12, weight: .regular, color: NSColor(calibratedWhite: 0.5, alpha: 1))
     hint.alignment = .center
     hint.frame = NSRect(x: 0,
         y: (screen.frame.height + blockH) / 2 - blockH,
         width: screen.frame.width, height: 18)
     content.cards.addSubview(hint)
+    content.hintLabel = hint
+    // a search survives the rebuild after a reorder — re-dim the fresh
+    // views (and restore the query line the label was born without)
+    content.applyFilter()
 
     tlog("laid out cards \(content.cardOrder) at "
         + "\(content.cardSlots.map { "\(Int($0.midX)),\(Int($0.midY))" }) "
@@ -927,8 +1300,9 @@ func showOverlay() {
     win.makeFirstResponder(placeholder)
     slpsFocus(pid: getpid(), wid: UInt32(win.windowNumber))
     let mon = monitorUnderCursor()
+    let screenName = screen.localizedName
     DispatchQueue.global().async {
-        let snap = snapshotWorkspaces(mon: mon)
+        let snap = snapshotWorkspaces(mon: mon, screenName: screenName)
         DispatchQueue.main.async {
             guard overlayVisible, let c = win.contentView as? ContentView else { return }
             buildOverlay(snap, into: c)

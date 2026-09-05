@@ -10,6 +10,16 @@
 # `omacosy-helper input-age`) or the swipe daemon's intent stamp (raw
 # multitouch contacts emit no CGEvents) is ≤2s old. Anything else is
 # an app self-activation: send the workspace straight back.
+
+# This hook is aerospace's exec-on-workspace-change contract (env vars,
+# bounce via its CLI); under OmniWM it never fires, but a straggler from
+# the handover must stand down, not bounce.
+# a live OmniWM answers its socket in ~3 ms; pgrep -f scanned every
+# process for 31 ms per call, and a stale socket after a crash cannot
+# fool a real request the way a file test could
+wm_is_omniwm() { "$HOME/.local/bin/omacosy-omni" active >/dev/null 2>&1; }
+wm_is_omniwm && exit 0
+
 # ~/.local/state (mode 700), not /tmp: these names are predictable,
 # and in a world-writable directory a planted symlink would redirect
 # every write below.

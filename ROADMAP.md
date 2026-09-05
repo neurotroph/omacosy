@@ -219,6 +219,8 @@ Center replacement.
 - **More themes.** `themes/<name>/` is copy-a-directory; omarchy's
   MIT-licensed palettes drop in. The easiest PR in the repo.
 - **Upstreaming.** The aerospace-swipe macOS 26 fixes are offered
-  upstream (acsandmann/aerospace-swipe #29/#30); an AeroSpace
+  upstream (acsandmann/aerospace-swipe #29/#30) — the engine now lives
+  in-tree as `omacosy-gesture`, so a merge is a courtesy, not a
+  dependency; an AeroSpace
   window-created hook would delete our SkyLight dependency for the
   bar's window events.

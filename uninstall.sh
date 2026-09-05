@@ -14,9 +14,13 @@ MANIFEST="$HOME/.local/state/omacosy/manifest"
 have() { [ -f "$MANIFEST" ] && grep -qxF "$1" "$MANIFEST"; }
 
 # --- 1. Stop the stack ------------------------------------------------------
-# Quitting AeroSpace restores windows it was managing.
-log "Stopping AeroSpace, the bar, borders"
+# Quitting the window manager restores windows it was managing —
+# whichever of the two is running (the OmniWM trial branch may have
+# either live; pkill backstops OmniWM's quit handler).
+log "Stopping AeroSpace/OmniWM, the bar, borders"
 osascript -e 'quit app "AeroSpace"' 2>/dev/null || true
+osascript -e 'quit app "OmniWM"' 2>/dev/null || true
+pkill -f OmniWM.app 2>/dev/null || true
 osascript -e 'quit app "Karabiner-Elements"' 2>/dev/null || true
 launchctl unload "$HOME/Library/LaunchAgents/com.omacosy.borders.plist" 2>/dev/null || true
 rm -f "$HOME/Library/LaunchAgents/com.omacosy.borders.plist" "$HOME/.local/bin/omacosy-borders"
@@ -55,14 +59,25 @@ rm -f /tmp/omacosy-*.log /tmp/omacosy-*.err /tmp/omacosy-bar-ws \
   "/tmp/omacosy-guard-bounce-$(id -u)" "/tmp/omacosy-guard-cooldown-$(id -u)" \
   "${TMPDIR:-/tmp}/omacosy-monitor-count" 2>/dev/null || true
 rmdir "/tmp/omacosy-spawn-$(id -u).lock.d" 2>/dev/null || true
-rm -rf "$HOME/.config/omacosy"
+# Only the files the installer wrote: this directory is the user's, and
+# a blanket rm -rf would take anything else they keep here with it.
+rm -f "$HOME/.config/omacosy/ffm-ignore" \
+  "$HOME/.config/omacosy/borders.conf" \
+  "$HOME/.config/omacosy/apps.conf" \
+  "$HOME/.config/omacosy/gesture.json" \
+  "$HOME/.config/omacosy/disabled"
+rmdir "$HOME/.config/omacosy" 2>/dev/null || true
 
-# aerospace-swipe: ONLY if we cloned it — a pre-existing install
-# (agent, app, clone) belongs to the user and stays untouched
+# omacosy-gesture (and the aerospace-swipe era before it: its agent,
+# and its clone ONLY if we made it — a pre-existing install stays)
+launchctl unload "$HOME/Library/LaunchAgents/com.omacosy.gesture.plist" 2>/dev/null || true
+rm -f "$HOME/Library/LaunchAgents/com.omacosy.gesture.plist"
+rm -rf "$HOME/.local/share/omacosy/omacosy-gesture.app"
+rm -f "$HOME/.local/bin/omacosy-omni"
 if have "cloned-aerospace-swipe" && [ -d "$HOME/.local/share/aerospace-swipe" ]; then
-  (cd "$HOME/.local/share/aerospace-swipe" && make uninstall) 2>/dev/null || true
-  rm -rf "$HOME/.local/share/aerospace-swipe"
-  rm -rf "$HOME/.config/aerospace-swipe"
+  launchctl unload "$HOME/Library/LaunchAgents/com.acsandmann.swipe.plist" 2>/dev/null || true
+  rm -f "$HOME/Library/LaunchAgents/com.acsandmann.swipe.plist"
+  rm -rf "$HOME/.local/share/aerospace-swipe" "$HOME/.config/aerospace-swipe"
 fi
 
 # --- 2. Native menu bar + system gestures back ------------------------------
@@ -118,6 +133,7 @@ grep '^copied-config ' "$MANIFEST" 2>/dev/null | sed 's/^copied-config //' |
 restore "$HOME/.zshrc"
 restore "$HOME/.config/starship.toml"
 restore "$HOME/.config/aerospace"
+restore "$HOME/.config/omniwm"
 restore "$HOME/.config/ghostty"
 
 # re-enable Karabiner's helper agents we disabled
@@ -145,7 +161,7 @@ fi
 
 # theme-set / theme-next out of ~/.local/bin — only when they are OUR
 # symlinks (a user's own script of the same name survives)
-for t in theme-set theme-next theme-bg-next omacosy-ws omacosy-toggle omacosy-focus-guard omacosy-ws-collapse omacosy-float omacosy-cycle omacosy-update omacosy-spawn omacosy-layout; do
+for t in theme-set theme-next theme-bg-next omacosy-ws omacosy-toggle omacosy-focus-guard omacosy-ws-collapse omacosy-float omacosy-cycle omacosy-update omacosy-spawn omacosy-layout omacosy-wm-switch omacosy-karabiner-omniwm; do
   target="$(readlink "$HOME/.local/bin/$t" 2>/dev/null || true)"
   case "$target" in *omacosy*) rm -f "$HOME/.local/bin/$t" ;; esac
 done
@@ -211,6 +227,8 @@ Done. Left in place on purpose:
   - Claude desktop's caps-lock dictation shortcut was removed during setup;
     re-enable it in Claude's settings if you used it.
   - If AeroSpace still appears in System Settings -> General -> Login Items, remove it there.
+  - OmniWM.app is a brew cask like the rest: removed above only when the
+    manifest says omacosy installed it; one that predates omacosy stays.
   - Permission entries (Accessibility, Input Monitoring, Screen Recording,
     Location, Bluetooth) stay listed in System Settings -> Privacy &
     Security — macOS lets no script remove them. The binaries they named

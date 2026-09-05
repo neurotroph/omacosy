@@ -17,7 +17,7 @@ about: Something broken in the omacosy stack
 exists of:
 
 ```sh
-ls -la /tmp/omacosy-*.log /tmp/swipe.out /tmp/swipe.err
+ls -la /tmp/omacosy-*.log
 ```
 
 For bar issues also paste the failing item's state:

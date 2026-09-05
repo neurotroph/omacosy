@@ -72,7 +72,8 @@ fi
 # Homebrew >=6 refuses third-party taps until explicitly trusted.
 # Only the taps the Brewfile actually draws from: felixkratz/formulae
 # left with sketchybar, and trusting a tap nothing installs from is
-# standing permission for a future formula nobody chose.
+# standing permission for a future formula nobody chose. OmniWM's tap
+# is trusted by omacosy-wm-switch, at the moment you ask for OmniWM.
 brew trust nikitabobko/tap 2>/dev/null || true
 
 log "Installing packages (brew bundle)"
@@ -170,6 +171,8 @@ link "$REPO_DIR/config/aerospace"    "$HOME/.config/aerospace"
 # ghostty reads this AND its Application Support config, so personal
 # settings there survive
 link "$REPO_DIR/config/ghostty"      "$HOME/.config/ghostty"
+# OmniWM trial (this branch): settings are canonical TOML, live-reloaded
+link "$REPO_DIR/config/omniwm"       "$HOME/.config/omniwm"
 
 # Karabiner is COPIED, not symlinked: its background services can't read
 # configs living under ~/Documents (TCC folder protection) without Full
@@ -184,9 +187,11 @@ if [ -f "$HOME/.config/karabiner/karabiner.json" ] \
 fi
 cp "$REPO_DIR/config/karabiner/karabiner.json" "$HOME/.config/karabiner/karabiner.json"
 launchctl kickstart -k "gui/$(id -u)/org.pqrs.service.agent.karabiner_console_user_server" 2>/dev/null || true
-# Karabiner's Menu and NotificationWindow helper apps idle at ~135MB
-# combined and serve a menu-bar icon we hide; remapping lives in the
-# core service, which stays
+# Karabiner's Menu and NotificationWindow helpers are disabled the
+# SUPPORTED way in karabiner.json (global.show_in_menu_bar and
+# global.enable_notification_window, both false) — the bootout below
+# is only the immediate cleanup for agents already running; the config
+# is what survives Karabiner updates, which used to resurrect them
 for agent in Karabiner-Menu Karabiner-NotificationWindow; do
   launchctl bootout "gui/$(id -u)/org.pqrs.service.agent.$agent" 2>/dev/null || true
   launchctl disable "gui/$(id -u)/org.pqrs.service.agent.$agent" 2>/dev/null || true
@@ -285,7 +290,7 @@ else
   log "  System Settings > Privacy & Security. Free fix: Xcode > Settings >"
   log "  Accounts > Manage Certificates > + > Apple Development, then re-run."
 fi
-# (aerospace-swipe is signed in section 5, AFTER its make install —
+# (omacosy-gesture is signed in section 5, right after its build —
 # the makefile re-signs ad-hoc as part of the build, so signing here
 # would be overwritten and every rebuild would invalidate the
 # Accessibility grant again)
@@ -361,6 +366,8 @@ link "$REPO_DIR/bin/omacosy-focus-guard" "$HOME/.local/bin/omacosy-focus-guard"
 link "$REPO_DIR/bin/omacosy-ws-collapse" "$HOME/.local/bin/omacosy-ws-collapse"
 link "$REPO_DIR/bin/omacosy-update" "$HOME/.local/bin/omacosy-update"
 link "$REPO_DIR/bin/omacosy-spawn" "$HOME/.local/bin/omacosy-spawn"
+link "$REPO_DIR/bin/omacosy-wm-switch" "$HOME/.local/bin/omacosy-wm-switch"
+link "$REPO_DIR/bin/omacosy-karabiner-omniwm" "$HOME/.local/bin/omacosy-karabiner-omniwm"
 link "$REPO_DIR/bin/omacosy-layout" "$HOME/.local/bin/omacosy-layout"
 link "$REPO_DIR/bin/omacosy-float" "$HOME/.local/bin/omacosy-float"
 link "$REPO_DIR/bin/omacosy-cycle" "$HOME/.local/bin/omacosy-cycle"
@@ -405,125 +412,86 @@ elif [ -d "/Applications/Korren.app" ]; then
   log "Created Korren config (theme follows omarchy)"
 fi
 
-# --- 5. Trackpad workspace swipes (aerospace-swipe) -------------------------
-# Built from source; installs a user launch agent. Config is COPIED (same
-# TCC constraint as Karabiner: launch agents can't read ~/Documents).
-SWIPE_DIR="$HOME/.local/share/aerospace-swipe"
-# A PINNED commit, not whatever the default branch says today. This is
-# the most privileged third-party thing the installer builds itself:
-# the result gets Accessibility and Input Monitoring, and is then
-# signed below with your own Apple Development identity so those
-# grants survive every later rebuild. Lending your code identity to a
-# moving target is the part that does not hold up — so the target does
-# not move. Bump this deliberately, after reading the diff, and re-run
-# install.sh; the patches below are verified against exactly this tree.
-SWIPE_COMMIT=16aad5a5ad678335a7593a2afaa473816c278c5f
-
-if [ ! -d "$SWIPE_DIR" ]; then
-  git clone -q https://github.com/acsandmann/aerospace-swipe.git "$SWIPE_DIR"
-  mark "cloned-aerospace-swipe"
+# --- 5. Trackpad gestures (omacosy-gesture) ---------------------------------
+# The gesture engine — absorbed from aerospace-swipe (MIT, notice kept in
+# helper/gesture/LICENSE.aerospace-swipe) with every omacosy fix folded
+# in — runs as a user launch agent. Under AeroSpace the horizontal
+# swipes use its socket directly; under OmniWM each direction runs a
+# command. Config is COPIED (launch agents can't read ~/Documents — TCC).
+GESTURE_APP="$HOME/.local/share/omacosy/omacosy-gesture.app"
+GESTURE_BIN="$GESTURE_APP/Contents/MacOS/omacosy-gesture"
+mkdir -p "$HOME/.config/omacosy"
+cp "$REPO_DIR/config/gesture/config.json" "$HOME/.config/omacosy/gesture.json"
+# the aerospace-swipe era: retire its agent, and its clone if it was ours
+if [ -f "$HOME/Library/LaunchAgents/com.acsandmann.swipe.plist" ]; then
+  launchctl unload "$HOME/Library/LaunchAgents/com.acsandmann.swipe.plist" 2>/dev/null || true
+  rm -f "$HOME/Library/LaunchAgents/com.acsandmann.swipe.plist"
 fi
-
-# The three patches go onto a KNOWN tree.
-#
-#   - macos26-raw-multitouch: read raw MultitouchSupport frames on all
-#     devices — event taps no longer carry multi-touch data on 26.3.
-#   - socket-recovery: one socket timeout used to strand the client in
-#     CLI mode for the whole session, and that CLI mode ran a bare
-#     `aerospace` a launch agent's PATH cannot resolve, so every swipe
-#     after plugging in a display silently did nothing.
-#   - wake-reregister: the built-in trackpad keeps its IOService across
-#     sleep, so no HID-attach fires, but the multitouch callback
-#     session can die anyway — swipes were dead after wake until a
-#     real hotplug.
-#
-# They are ORDERED (wake-reregister patches code the first one adds),
-# so applying "whichever ones still fit" is not a thing: a clone we
-# made holds nothing but upstream plus these patches, which makes
-# checking the pin back out exactly the same as un-applying them.
-# Every run then rebuilds the same stack from the same base. A clone
-# the user brought themselves is never reset — only what still applies
-# goes on, as before.
-apply_swipe_patches() {
-  for p in macos26-raw-multitouch socket-recovery wake-reregister; do
-    git -C "$SWIPE_DIR" apply "$REPO_DIR/patches/aerospace-swipe-$p.patch" ||
-      log "WARNING: patch $p did not apply — swipe gestures may misbehave"
-  done
-}
-if have "cloned-aerospace-swipe"; then
-  if ! git -C "$SWIPE_DIR" cat-file -e "$SWIPE_COMMIT^{commit}" 2>/dev/null; then
-    git -C "$SWIPE_DIR" fetch -q origin 2>/dev/null || true
-  fi
-  if git -C "$SWIPE_DIR" checkout -q --force --detach "$SWIPE_COMMIT" 2>/dev/null; then
-    apply_swipe_patches
-  else
-    log "WARNING: could not check out aerospace-swipe $SWIPE_COMMIT."
-    log "  Leaving the clone as it is — swipes keep whatever build they had."
-  fi
-else
-  for p in macos26-raw-multitouch socket-recovery wake-reregister; do
-    if git -C "$SWIPE_DIR" apply --check "$REPO_DIR/patches/aerospace-swipe-$p.patch" 2>/dev/null; then
-      git -C "$SWIPE_DIR" apply "$REPO_DIR/patches/aerospace-swipe-$p.patch"
-    fi
-  done
+if grep -qxF "cloned-aerospace-swipe" "$MANIFEST" 2>/dev/null && [ -d "$HOME/.local/share/aerospace-swipe" ]; then
+  rm -rf "$HOME/.local/share/aerospace-swipe" "$HOME/.config/aerospace-swipe"
 fi
-
-mkdir -p "$HOME/.config/aerospace-swipe"
-cp "$REPO_DIR/config/aerospace-swipe/config.json" "$HOME/.config/aerospace-swipe/config.json"
 # Rebuilding this daemon COSTS ITS ACCESSIBILITY GRANT: measured on
 # macOS 26.3, TCC pins the grant to the exact build (any re-sign is a
 # new subject — a stable Apple Development identity does not carry it),
 # so every rebuild means dead swipes until the user re-grants. The only
 # safe rebuild is the one that does not happen: skip the whole block
-# unless the binary is missing or the sources actually changed.
-#
-# "Changed" has to mean CONTENT, never timestamps. The pin-and-repatch
-# above rewrites every patched file on every run, so an mtime probe
-# would call the tree stale each time and rebuild each time — exactly
-# what this check exists to prevent. So fingerprint the build inputs
-# and keep the answer next to the binary it describes.
-SWIPE_BIN="$SWIPE_DIR/AerospaceSwipe.app/Contents/MacOS/AerospaceSwipe"
-SWIPE_STAMP="$SWIPE_DIR/.omacosy-build-stamp"
-SWIPE_FP="$(
-  find "$SWIPE_DIR/src" "$SWIPE_DIR/makefile" -type f -exec shasum {} + 2>/dev/null |
-    sort || true
-)"
-SWIPE_FP="$(printf '%s' "$SWIPE_FP" | shasum | cut -d' ' -f1)"
-SWIPE_STALE=""
-if [ ! -x "$SWIPE_BIN" ]; then
-  SWIPE_STALE=1
-elif [ "$SWIPE_FP" != "$(cat "$SWIPE_STAMP" 2>/dev/null || true)" ]; then
-  SWIPE_STALE=1
+# unless the binary is missing or a source file actually changed.
+# omacosy-omni: the scripts' held-socket client for OmniWM (plain C,
+# ~3 ms launch; no grants involved, so it is simply rebuilt when stale)
+G="$REPO_DIR/helper/gesture"
+if [ ! -x "$HOME/.local/bin/omacosy-omni" ] || find "$G/omniwm.c" "$G/omniwm.h" "$G/omnicli.c" "$G/yyjson.c" "$G/yyjson.h" -newer "$HOME/.local/bin/omacosy-omni" 2>/dev/null | grep -q .; then
+  clang -std=c99 -O2 -arch arm64 -o "$HOME/.local/bin/omacosy-omni" "$G/omniwm.c" "$G/yyjson.c" "$G/omnicli.c" -framework ApplicationServices -framework CoreFoundation \
+    || echo "omacosy-omni build failed"
 fi
-if [ -n "$SWIPE_STALE" ]; then
-  log "Building aerospace-swipe (grant Accessibility when prompted)"
-  # pre-unload: the makefile ends with launchctl load, which fails on
-  # an already-loaded agent and made every re-run print a false failure
-  launchctl unload "$HOME/Library/LaunchAgents/com.acsandmann.swipe.plist" 2>/dev/null || true
-  # build and stage WITHOUT launching (`make install` ends in launchctl
-  # load): sign with the stable identity before anything runs, so the
-  # only binary launchd ever starts is the one the user grants. Keep
-  # the entitlements the makefile applied.
-  if (cd "$SWIPE_DIR" && make all bundle install_plist); then
-    if security find-identity -p codesigning -v 2>/dev/null | grep -q "Apple Development"; then
-      codesign -f -s "Apple Development" --identifier com.acsandmann.swipe \
-        --entitlements "$SWIPE_DIR/accessibility.entitlements" \
-        "$SWIPE_DIR/AerospaceSwipe.app" 2>/dev/null || true
-    fi
-    # only a build that finished gets to claim these sources
-    printf '%s\n' "$SWIPE_FP" > "$SWIPE_STAMP"
+GESTURE_STALE=""
+if [ ! -x "$GESTURE_BIN" ]; then GESTURE_STALE=1
+elif find "$REPO_DIR/helper/gesture" -newer "$GESTURE_BIN" 2>/dev/null | grep -q .; then GESTURE_STALE=1
+fi
+if [ -n "$GESTURE_STALE" ]; then
+  log "Building omacosy-gesture (grant Accessibility + Input Monitoring when prompted)"
+  launchctl unload "$HOME/Library/LaunchAgents/com.omacosy.gesture.plist" 2>/dev/null || true
+  G="$REPO_DIR/helper/gesture"
+  mkdir -p "$GESTURE_APP/Contents/MacOS"
+  clang -std=c99 -O3 -fobjc-arc -arch arm64 \
+    -Wno-pointer-integer-compare -Wno-incompatible-pointer-types-discards-qualifiers -Wno-absolute-value \
+    -o "$GESTURE_BIN" "$G/aerospace.c" "$G/omniwm.c" "$G/yyjson.c" "$G/haptic.c" "$G/event_tap.m" "$G/main.m" \
+    -framework CoreFoundation -framework IOKit -F/System/Library/PrivateFrameworks -framework MultitouchSupport \
+    -framework ApplicationServices -framework Cocoa -ldl \
+    || echo "omacosy-gesture build failed"
+  cp "$G/gesture-info.plist" "$GESTURE_APP/Contents/Info.plist"
+  echo "APPL????" > "$GESTURE_APP/Contents/PkgInfo"
+  # sign BEFORE anything launches: the only binary launchd ever starts
+  # is the one the user grants
+  if security find-identity -p codesigning -v 2>/dev/null | grep -q "Apple Development"; then
+    codesign -f -s "Apple Development" --identifier com.omacosy.gesture \
+      --entitlements "$G/accessibility.entitlements" "$GESTURE_APP" 2>/dev/null || true
   else
-    echo "aerospace-swipe build failed — run manually: cd $SWIPE_DIR && make install"
+    codesign -f --entitlements "$G/accessibility.entitlements" --sign - "$GESTURE_APP" 2>/dev/null || true
   fi
 fi
-launchctl load "$HOME/Library/LaunchAgents/com.acsandmann.swipe.plist" 2>/dev/null || true
+cat > "$HOME/Library/LaunchAgents/com.omacosy.gesture.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.omacosy.gesture</string>
+  <key>ProgramArguments</key><array><string>$GESTURE_BIN</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>$RUN_DIR/gesture.log</string>
+  <key>StandardErrorPath</key><string>$RUN_DIR/gesture.log</string>
+</dict></plist>
+PLIST
+launchctl unload "$HOME/Library/LaunchAgents/com.omacosy.gesture.plist" 2>/dev/null || true
+launchctl load "$HOME/Library/LaunchAgents/com.omacosy.gesture.plist" 2>/dev/null || true
 # a rebuild strands the daemon in its permission-wait loop with no
 # visible symptom but dead swipes — check and say so out loud
 sleep 2
-if tail -5 /tmp/swipe.err 2>/dev/null | grep -q "Waiting for accessibility"; then
-  log "WARNING: aerospace-swipe is waiting for its Accessibility grant"
+if tail -5 "$RUN_DIR/gesture.log" 2>/dev/null | grep -q "Waiting for accessibility"; then
+  log "WARNING: omacosy-gesture is waiting for its Accessibility grant"
   log "  (a rebuild makes macOS treat it as a new app — this is a macOS rule, not a bug)."
-  log "  Fix: System Settings -> Privacy & Security -> Accessibility -> toggle AerospaceSwipe"
+  log "  Fix: System Settings -> Privacy & Security -> Accessibility -> toggle omacosy-gesture"
 fi
 
 # --- 6. macOS look ----------------------------------------------------------
@@ -532,11 +500,15 @@ fi
 # --- 7. Services ------------------------------------------------------------
 
 
-log "Starting AeroSpace"
+# OmniWM trial (this branch): installing NEVER switches the window
+# manager — a half-configured switch once stranded the user on one
+# workspace with no way back. AeroSpace starts as always; moving to
+# OmniWM is an explicit, dead-man-guarded step:
+#
+#   omacosy-wm-switch omniwm      # snapshot, grant-first, auto-revert
+#   omacosy-wm-switch aerospace   # the way back
+log "Starting AeroSpace (switch to OmniWM with: omacosy-wm-switch omniwm)"
 open -a AeroSpace
-# an ALREADY-running AeroSpace does not re-read its config on `open` —
-# without this, updates that change keybindings or rules look applied
-# but are not until the next restart
 sleep 1
 "$(command -v aerospace || echo /opt/homebrew/bin/aerospace)" reload-config 2>/dev/null || true
 

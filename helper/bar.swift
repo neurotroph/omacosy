@@ -24,6 +24,7 @@
 // for the network, IOBluetooth for devices. Every one of those is a
 // publisher, so nothing here polls except the clock and the weather,
 // which have no publisher to listen to.
+import ApplicationServices
 import AppKit
 import CoreAudio
 import CoreBluetooth
@@ -32,6 +33,7 @@ import CoreWLAN
 import IOBluetooth
 import IOKit.ps
 import SystemConfiguration
+import UniformTypeIdentifiers
 
 // DisplayServices (private) — the same calls Control Center makes, and
 // the same ones helper/main.swift uses for `omacosy-helper brightness`.
@@ -111,6 +113,74 @@ let runDir: String = {
 }()
 
 let logURL = URL(fileURLWithPath: "\(runDir)/bar.log")
+
+// The OTHER window manager. omacosy-wm-switch can hand the session from
+// AeroSpace to OmniWM (and back) while this daemon runs, so which one is
+// asked is decided per use, never cached: the running-app check is an
+// in-process lookup, cheap enough to be the whole detection.
+let omniwmBundleID = "com.barut.OmniWM"
+
+func omniwmActive() -> Bool {
+    !NSRunningApplication.runningApplications(withBundleIdentifier: omniwmBundleID).isEmpty
+}
+
+let omniwmctlBin = ["/opt/homebrew/bin/omniwmctl",
+                    "/Applications/OmniWM.app/Contents/MacOS/omniwmctl"]
+    .first { FileManager.default.isExecutableFile(atPath: $0) } ?? "omniwmctl"
+
+@discardableResult
+func omniwmctl(_ args: [String]) -> String { shell(omniwmctlBin, args) }
+
+// exec a binary at an absolute path, stdout back (the omniQuery fast path)
+func shellOut(_ bin: String, _ args: [String]) -> String {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: bin)
+    p.arguments = args
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return "" }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return String(data: data, encoding: .utf8) ?? ""
+}
+
+// One query, unwrapped to its payload. The CLI prints the whole
+// IPCResponse envelope; everything the bar wants lives two levels down
+// at result.payload (OmniWM docs/IPC-CLI.md, "Response Format").
+func omniQuery(_ name: String, _ args: [String] = []) -> [String: Any]? {
+    // fast path: omacosy-omni holds a persistent socket and launches in
+    // ~3 ms where omniwmctl (Swift) needs ~10; it speaks `query <name>
+    // [fields-csv]` and prints the same envelope. Anything fancier
+    // (selector flags like --focused) stays on omniwmctl.
+    let omni = "\(NSHomeDirectory())/.local/bin/omacosy-omni"
+    var out = ""
+    if FileManager.default.isExecutableFile(atPath: omni),
+       args.isEmpty || (args.count == 2 && args[0] == "--fields") {
+        out = shellOut(omni, args.isEmpty ? ["query", name] : ["query", name, args[1]])
+    }
+    if out.isEmpty {
+        out = omniwmctl(["query", name] + args + ["--format", "json"])
+    }
+    guard let data = out.data(using: .utf8),
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          (root["ok"] as? Bool) == true,
+          let result = root["result"] as? [String: Any]
+    else { return nil }
+    return result["payload"] as? [String: Any]
+}
+
+// click-to-jump, whichever WM is listening. OmniWM's focus-name resolves
+// a numeric raw workspace ID across all monitors, which is exactly what a
+// chip on either display means.
+func focusWorkspace(_ ws: String) {
+    if omniwmActive() {
+        omniwmctl(["workspace", "focus-name", ws])
+    } else {
+        aerospace(["workspace", ws])
+    }
+}
+
 func tlog(_ m: String) {
     let line = "\(Date()) \(m)\n"
     if let h = try? FileHandle(forWritingTo: logURL) {
@@ -121,6 +191,120 @@ func tlog(_ m: String) {
         try? line.data(using: .utf8)!.write(to: logURL)
     }
 }
+
+private struct BundleIdentifier {
+    let rawValue: String
+
+    init?(_ rawValue: String) {
+        let segments = rawValue.split(separator: ".", omittingEmptySubsequences: false)
+        guard segments.count >= 2,
+              segments.allSatisfy({ segment in
+                  guard let first = segment.unicodeScalars.first,
+                        BundleIdentifier.isAlphanumeric(first) else { return false }
+                  return segment.unicodeScalars.allSatisfy(BundleIdentifier.isAlphanumericOrHyphen)
+              })
+        else { return nil }
+        self.rawValue = rawValue
+    }
+
+    private static func isAlphanumeric(_ scalar: UnicodeScalar) -> Bool {
+        (48...57).contains(scalar.value) || (65...90).contains(scalar.value)
+            || (97...122).contains(scalar.value)
+    }
+
+    private static func isAlphanumericOrHyphen(_ scalar: UnicodeScalar) -> Bool {
+        isAlphanumeric(scalar) || scalar.value == 45
+    }
+}
+
+private enum WorkspaceIcon {
+    case glyph(String)
+    case image(NSImage)
+    case unavailable
+}
+
+private enum WorkspaceIconDeclaration {
+    case glyph(String)
+    case bundle(BundleIdentifier)
+}
+
+private struct WorkspaceIconConfig {
+    let values: [String: WorkspaceIcon]
+
+    func icon(for workspace: String) -> WorkspaceIcon? {
+        if let icon = values[workspace] { return icon }
+        guard workspace.count > 1,
+              workspace.unicodeScalars.allSatisfy({ (48...57).contains($0.value) }),
+              let last = workspace.unicodeScalars.last,
+              (49...57).contains(last.value)
+        else { return nil }
+        return values[String(Character(last))]
+    }
+}
+
+private func loadWorkspaceIconConfig() -> WorkspaceIconConfig {
+    let file = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".config/omacosy/workspace-icons.conf")
+    guard FileManager.default.fileExists(atPath: file.path) else {
+        return WorkspaceIconConfig(values: [:])
+    }
+    guard let text = try? String(contentsOf: file, encoding: .utf8) else {
+        tlog("workspace-icons: could not read \(file.path)")
+        return WorkspaceIconConfig(values: [:])
+    }
+
+    var declarations: [String: WorkspaceIconDeclaration] = [:]
+    for (offset, rawLine) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+        let lineNumber = offset + 1
+        let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty, !line.hasPrefix("#") else { continue }
+        guard let separator = line.firstIndex(of: "=") else {
+            tlog("workspace-icons: malformed line \(lineNumber)")
+            continue
+        }
+        let key = String(line[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = String(line[line.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty, !value.isEmpty else {
+            tlog("workspace-icons: malformed line \(lineNumber)")
+            continue
+        }
+
+        let declaration: WorkspaceIconDeclaration?
+        if let bundle = BundleIdentifier(value) {
+            declaration = .bundle(bundle)
+        } else if value.unicodeScalars.count == 1 {
+            declaration = .glyph(value)
+        } else {
+            declaration = nil
+        }
+        guard let declaration else {
+            tlog("workspace-icons: malformed line \(lineNumber)")
+            continue
+        }
+        if declarations[key] != nil {
+            tlog("workspace-icons: duplicate \(key) on line \(lineNumber), last valid value wins")
+        }
+        declarations[key] = declaration
+    }
+
+    var values: [String: WorkspaceIcon] = [:]
+    for (key, declaration) in declarations {
+        switch declaration {
+        case .glyph(let glyph):
+            values[key] = .glyph(glyph)
+        case .bundle(let identifier):
+            guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier.rawValue) else {
+                tlog("workspace-icons: \(key) could not resolve \(identifier.rawValue)")
+                values[key] = .unavailable
+                continue
+            }
+            values[key] = .image(NSWorkspace.shared.icon(forFile: url.path))
+        }
+    }
+    return WorkspaceIconConfig(values: values)
+}
+
+private let workspaceIconConfig = loadWorkspaceIconConfig()
 
 // --- theme ----------------------------------------------------------------
 // The same palette sketchybar reads. Parsed once and kept as colours, not
@@ -218,11 +402,16 @@ struct Snapshot {
     var perMonitor: [String: (workspaces: [String], visible: String)] = [:]
     var soleApp: [String: String] = [:]
     var occupied: Set<String> = []
+    var focused = "" // omniwm only — under aerospace the fast path owns it
 }
 
 let rebuildQueue = DispatchQueue(label: "com.omacosy.bar.rebuild")
 
 func fetchSnapshot() -> Snapshot {
+    omniwmActive() ? omniwmSnapshot() : aerospaceSnapshot()
+}
+
+func aerospaceSnapshot() -> Snapshot {
     var s = Snapshot()
     // ONE call for every monitor's set and which of them is visible: the
     // old loop spent two subprocesses per display, so docking doubled it
@@ -261,6 +450,63 @@ func fetchSnapshot() -> Snapshot {
     return s
 }
 
+// The same answers out of omniwmctl, on the same two-subprocess budget:
+// workspaces arrive with their display and visibility in one query, and
+// the windows query brings the app names the sole-app chips need. The
+// snapshot also carries focus — OmniWM has no exec-on-workspace-change
+// hook to feed the run dir's bar-ws, so it rides the slow path here and
+// the watch stream below covers the fast one.
+func omniwmSnapshot() -> Snapshot {
+    var s = Snapshot()
+    var sets: [String: [String]] = [:]
+    var visible: [String: String] = [:]
+    if let list = omniQuery("workspaces",
+                            ["--fields", "raw-name,display"])?["workspaces"]
+        as? [[String: Any]] {
+        for w in list {
+            guard let name = w["rawName"] as? String,
+                  let monitor = (w["display"] as? [String: Any])?["id"] as? String else { continue }
+            sets[monitor, default: []].append(name)
+        }
+    }
+    // visible/focused come from the DISPLAYS query: the workspaces
+    // query's isVisible/isFocused go dark on EMPTY workspaces (the
+    // same trap omacosy-ws hit), and the pill for a focused empty 8/9
+    // never lit up
+    if let displays = omniQuery("displays", [])?["displays"] as? [[String: Any]] {
+        for d in displays {
+            guard let id = d["id"] as? String,
+                  let active = (d["activeWorkspace"] as? [String: Any])?["rawName"] as? String
+            else { continue }
+            visible[id] = active
+            if (d["isCurrent"] as? Bool) == true { s.focused = active }
+        }
+    }
+    for id in surfaces.map({ $0.monitorID }) {
+        s.perMonitor[id] = (sets[id] ?? [], visible[id] ?? "")
+    }
+
+    var sole: [String: String] = [:]
+    var count: [String: Int] = [:]
+    if let list = omniQuery("windows", ["--fields", "workspace,app,mode"])?["windows"]
+        as? [[String: Any]] {
+        for w in list {
+            guard let ws = (w["workspace"] as? [String: Any])?["rawName"] as? String,
+                  let app = (w["app"] as? [String: Any])?["name"] as? String else { continue }
+            guard (w["mode"] as? String) != "floating" else { continue }
+            s.occupied.insert(ws)
+            if let existing = sole[ws] {
+                if existing != app { count[ws] = 2 }
+            } else {
+                sole[ws] = app
+                count[ws] = 1
+            }
+        }
+    }
+    s.soleApp = sole.filter { count[$0.key] == 1 }
+    return s
+}
+
 // Reports whether anything actually moved. A workspace switch produces
 // window moves too, and those snapshots come back identical — saying so
 // keeps the repaint (and the log line) for the times something changed.
@@ -281,6 +527,7 @@ func apply(_ s: Snapshot) -> Bool {
     }
     if model.occupied != s.occupied { model.occupied = s.occupied; changed = true }
     if model.soleApp != s.soleApp { model.soleApp = s.soleApp; changed = true }
+    if !s.focused.isEmpty, model.focused != s.focused { model.focused = s.focused; changed = true }
     return changed
 }
 
@@ -985,7 +1232,10 @@ func updateWeather() {
 
 struct PopupRow {
     var icon = ""
+    var image: NSImage? // 16pt leading icon — Recent Items entries
     var text = ""
+    var detail = "" // right-aligned, dim — menu shortcuts live here
+    var separator = false // a thin rule instead of content
     var hero = false // accent, bold — the title row
     var dim = false // the quiet action footer
     var highlight = false // today's week, the active device
@@ -1001,6 +1251,9 @@ let popupRadius: CGFloat = 8
 final class PopupView: NSView {
     var rows: [PopupRow] = []
     private var rowRects: [(Int, NSRect)] = []
+    // the row under the pointer, actionable rows only — menus read as
+    // menus when they answer the hover
+    private var hoveredRow: Int?
 
     // NOT flipped: CTLineDraw draws in the CONTEXT's coordinates, so a
     // flipped view renders every glyph mirrored. NSString.draw hid that
@@ -1021,36 +1274,52 @@ final class PopupView: NSView {
         return palette.label
     }
 
+    // separators are hairlines, not rows: a full 26 pt of blank per
+    // rule made long menus read bulky instead of sectioned
+    func rowH(_ row: PopupRow) -> CGFloat { row.separator ? 10 : rowHeight }
+
     func measure() -> NSSize {
         var width: CGFloat = 0
+        var height: CGFloat = popupPad * 2
         for row in rows {
             var w = advance(row.text, font(row))
+            if !row.detail.isEmpty { w += advance(row.detail, nerdFont("Regular", 11)) + 24 }
             if !row.icon.isEmpty { w += inkBox(row.icon, nerdFont("Bold", 13)).width + 8 }
+            if row.image != nil { w += 22 }
             if row.slider != nil { w = max(w, 150) }
             width = max(width, w)
+            height += rowH(row)
         }
-        return NSSize(width: width + popupPad * 2 + 20,
-                      height: CGFloat(rows.count) * rowHeight + popupPad * 2)
+        return NSSize(width: width + popupPad * 2 + 20, height: height)
     }
 
     override func draw(_ dirtyRect: NSRect) {
         rowRects.removeAll()
-        let body = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
-                                xRadius: popupRadius, yRadius: popupRadius)
+        // plain fill: the scroll CONTAINER carries the rounded clip and
+        // border, so corners stay put while tall content scrolls
         palette.barBG.setFill()
-        body.fill()
-        palette.accent.setStroke()
-        body.lineWidth = 1
-        body.stroke()
+        bounds.fill()
 
-        var y = bounds.height - popupPad - rowHeight
+        var y = bounds.height - popupPad
         for (index, row) in rows.enumerated() {
-            let rect = NSRect(x: popupPad, y: y, width: bounds.width - popupPad * 2, height: rowHeight)
-            if row.highlight {
+            let h = rowH(row)
+            y -= h
+            let rect = NSRect(x: popupPad, y: y, width: bounds.width - popupPad * 2, height: h)
+            if row.separator {
+                palette.label.withAlphaComponent(0.15).setFill()
+                NSRect(x: rect.minX + 2, y: rect.midY - 0.5, width: rect.width - 4, height: 1).fill()
+                rowRects.append((index, rect))
+                continue
+            }
+            if row.highlight || index == hoveredRow {
                 palette.itemBG.setFill()
                 NSBezierPath(roundedRect: rect.insetBy(dx: -2, dy: 2), xRadius: 4, yRadius: 4).fill()
             }
             var x = rect.minX + 4
+            if let image = row.image {
+                image.draw(in: NSRect(x: x, y: rect.midY - 8, width: 16, height: 16))
+                x += 22
+            }
             if !row.icon.isEmpty {
                 // same strategy as the bar: glyphs centre on ink, text on
                 // cap height — one way of placing things in this file
@@ -1073,10 +1342,15 @@ final class PopupView: NSView {
                 drawText(row.text, font(row), color(row),
                          leftAt: rect.maxX - advance(row.text, font(row)) - 4, midY: rect.midY)
             } else {
-                drawText(row.text, font(row), color(row), leftAt: x, midY: rect.midY)
+                let tint = index == hoveredRow && row.action != nil ? palette.accent : color(row)
+                drawText(row.text, font(row), tint, leftAt: x, midY: rect.midY)
+                if !row.detail.isEmpty {
+                    let df = nerdFont("Regular", 11)
+                    drawText(row.detail, df, palette.label.withAlphaComponent(0.5),
+                             leftAt: rect.maxX - advance(row.detail, df) - 4, midY: rect.midY)
+                }
             }
             rowRects.append((index, rect))
-            y -= rowHeight
         }
     }
 
@@ -1088,11 +1362,20 @@ final class PopupView: NSView {
         super.updateTrackingAreas()
         trackingAreas.forEach(removeTrackingArea)
         addTrackingArea(NSTrackingArea(rect: bounds,
-                                       options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
                                        owner: self))
     }
 
-    override func mouseExited(with event: NSEvent) { scheduleHullCheck() }
+    override func mouseMoved(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        let hit = rowRects.first(where: { $0.1.contains(p) && rows[$0.0].action != nil })?.0
+        if hit != hoveredRow { hoveredRow = hit; needsDisplay = true }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        if hoveredRow != nil { hoveredRow = nil; needsDisplay = true }
+        scheduleHullCheck()
+    }
 
     private func slide(_ event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
@@ -1131,14 +1414,29 @@ func closePopup() {
 
 // rows are rebuilt, not patched: the content is cheap to regenerate and a
 // stale row is worse than a redrawn one
+// exact-fit on every refresh: grow-only left the app-menu popup huge
+// after backing out of a long menu. The window is bottom-anchored, so
+// the frame is recomputed to keep the TOP edge pinned under the bar.
+var popupTopY: CGFloat = 0
+var popupAnchorX: CGFloat = 0
+var popupAlignLeft = false
+
 func refreshPopup() {
     guard let name = openPopup, let view = popupView, let window = popupWindow else { return }
     view.rows = popupRows(for: name)
-    var size = view.measure()
-    size.width = max(size.width, window.frame.width)
-    size.height = max(size.height, window.frame.height)
-    window.setContentSize(size)
+    let size = view.measure()
+    let screen = window.screen ?? NSScreen.main
+    var winH = size.height
+    var x = popupAlignLeft ? popupAnchorX : popupAnchorX - size.width
+    if let screen {
+        winH = min(size.height, popupTopY - screen.frame.minY - 20)
+        x = min(max(screen.frame.minX + 6, x), screen.frame.maxX - size.width - 6)
+    }
+    window.setFrame(NSRect(x: x, y: popupTopY - winH,
+                           width: size.width, height: winH), display: false)
+    (window.contentView as? NSScrollView)?.frame = NSRect(origin: .zero, size: NSSize(width: size.width, height: winH))
     view.frame = NSRect(origin: .zero, size: size)
+    view.scroll(NSPoint(x: 0, y: max(0, size.height - winH))) // drilling resets to the top
     view.needsDisplay = true
     view.display()
 }
@@ -1154,13 +1452,19 @@ func showPopup(_ name: String, under anchor: NSRect, on surface: BarSurface, ali
     let size = view.measure()
     view.frame = NSRect(origin: .zero, size: size)
 
-    // right-aligned under the item, clamped to the screen it opened on
+    // right-aligned under the item, clamped to the screen it opened on;
+    // taller-than-screen content (Recent Items) scrolls inside a capped
+    // window instead of running off the display
     let screen = surface.screen
     let barBottom = surface.window.frame.minY
+    popupTopY = barBottom - 4
+    popupAnchorX = alignLeft ? anchor.minX : anchor.maxX
+    popupAlignLeft = alignLeft
+    let winH = min(size.height, popupTopY - screen.frame.minY - 20)
     var x = alignLeft ? anchor.minX : anchor.maxX - size.width
     x = min(max(screen.frame.minX + 6, x), screen.frame.maxX - size.width - 6)
-    let window = PopupWindow(contentRect: NSRect(x: x, y: barBottom - size.height - 4,
-                                                 width: size.width, height: size.height),
+    let window = PopupWindow(contentRect: NSRect(x: x, y: popupTopY - winH,
+                                                 width: size.width, height: winH),
                              styleMask: .borderless, backing: .buffered, defer: false)
     window.isOpaque = false
     window.backgroundColor = .clear
@@ -1168,7 +1472,19 @@ func showPopup(_ name: String, under anchor: NSRect, on surface: BarSurface, ali
     window.level = .popUpMenu
     window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
     window.acceptsMouseMovedEvents = true
-    window.contentView = view
+    let scroll = NSScrollView(frame: NSRect(origin: .zero, size: NSSize(width: size.width, height: winH)))
+    scroll.drawsBackground = false
+    scroll.hasVerticalScroller = true
+    scroll.scrollerStyle = .overlay
+    scroll.autohidesScrollers = true
+    scroll.documentView = view
+    scroll.wantsLayer = true
+    scroll.layer?.cornerRadius = popupRadius
+    scroll.layer?.masksToBounds = true
+    scroll.layer?.borderWidth = 1
+    scroll.layer?.borderColor = palette.accent.cgColor
+    window.contentView = scroll
+    view.scroll(NSPoint(x: 0, y: max(0, size.height - winH))) // start at the top
     window.orderFrontRegardless()
     popupWindow = window
     popupView = view
@@ -1423,15 +1739,193 @@ func appleRows() -> [PopupRow] {
 
 func popupRows(for name: String) -> [PopupRow] {
     switch name {
-    case "apple": return appleRows()
+    case "apple": return appleMenuRows()
     case "clock": return calendarRows()
     case "weather": return weatherRows()
     case "brightness": return brightnessRows()
     case "volume": return volumeRows()
     case "wifi": return wifiRows()
     case "bluetooth": return bluetoothRows()
+    case "appmenu": return appMenuRows()
     default: return []
     }
+}
+
+// The focused app's menu bar, read over Accessibility and rendered
+// INSIDE our popup: top level lists File/Edit/…, clicking drills into
+// that menu's actual items, and clicking a leaf performs its AXPress —
+// the command runs with no native menu ever appearing. A navigation
+// stack lives for the popup's lifetime; "‹" walks back up.
+var appMenuStack: [(title: String, element: AXUIElement)] = []
+
+private func axChildren(_ element: AXUIElement) -> [AXUIElement] {
+    var ref: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, "AXChildren" as CFString, &ref) == .success,
+          let children = ref as? [AXUIElement] else { return [] }
+    return children
+}
+
+private func axString(_ element: AXUIElement, _ attr: String) -> String {
+    var ref: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, attr as CFString, &ref) == .success else { return "" }
+    return ref as? String ?? ""
+}
+
+// one menu's items as popup rows — shared by the app drill-down and the
+// apple pill. A menu bar item wraps one AXMenu; the items live inside.
+// AXEnabled is a lie for closed menus: apps validate items lazily when
+// a menu OPENS, so unopened menus read mostly disabled (Arc's whole
+// Tabs menu greyed out). Render all leaves live; a truly disabled
+// item's AXPress just no-ops.
+// Recent Items: AX exposes no menu-item images, but its entries are
+// apps and documents whose icons Launch Services can resolve by name —
+// the section headers ("Applications"/"Documents"/"Servers") say which
+// strategy applies. Headers render dim, entries get real icons.
+func recentItemIcon(_ title: String, section: String) -> NSImage? {
+    if section == "Applications" {
+        if let app = NSWorkspace.shared.runningApplications.first(where: { $0.localizedName == title }),
+           let icon = app.icon { return icon }
+        if let path = NSWorkspace.shared.fullPath(forApplication: title) {
+            return NSWorkspace.shared.icon(forFile: path)
+        }
+        return nil
+    }
+    if section == "Documents" {
+        let ext = (title as NSString).pathExtension
+        if !ext.isEmpty, let type = UTType(filenameExtension: ext) {
+            return NSWorkspace.shared.icon(for: type)
+        }
+        return NSWorkspace.shared.icon(for: .data)
+    }
+    return nil
+}
+
+func rowsForMenu(_ element: AXUIElement, context: String = "",
+                 collapseAlternates: Bool = false) -> [PopupRow] {
+    let container = axChildren(element).first ?? element
+    var rows: [PopupRow] = []
+    var section = ""
+    var prevTitle = ""
+    let recents = context == "Recent Items"
+    for item in axChildren(container) {
+        let title = axString(item, "AXTitle")
+        if title.isEmpty {
+            if rows.last?.separator != true { rows.append(PopupRow(separator: true)) }
+            prevTitle = ""
+            continue
+        }
+        // the Apple menu carries hold-Option ALTERNATES ("Restart…" then
+        // "Restart", "Force Quit…" then "Force Quit Arc") that the native
+        // menu hides — AX enumerates them flat. An item whose title
+        // extends its predecessor's (ellipsis stripped) is the alternate.
+        if collapseAlternates, !prevTitle.isEmpty {
+            let base = prevTitle.replacingOccurrences(of: "…", with: "")
+            if title.hasPrefix(base) { continue }
+        }
+        prevTitle = title
+        // Recent Items' own hold-Option alternates ("Show X in Finder")
+        // carry a different title shape than the root menu's (English UI;
+        // the pattern is locale-bound, worst case they reappear)
+        if recents, title.hasPrefix("Show “"), title.hasSuffix("” in Finder") { continue }
+        if recents, ["Applications", "Documents", "Servers"].contains(title) {
+            section = title
+            rows.append(PopupRow(text: title, dim: true))
+            continue
+        }
+        if !axChildren(item).isEmpty {
+            rows.append(PopupRow(icon: "›", text: title, action: {
+                appMenuStack.append((title, item))
+                refreshPopup()
+            }))
+        } else {
+            let cmd = axString(item, "AXMenuItemCmdChar")
+            rows.append(PopupRow(image: recents ? recentItemIcon(title, section: section) : nil,
+                                 text: title, detail: cmd.isEmpty ? "" : "⌘\(cmd)", action: {
+                closePopup()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    AXUIElementPerformAction(item, "AXPress" as CFString)
+                }
+            }))
+        }
+    }
+    return rows
+}
+
+// the frontmost app's AX menu bar, resolved the popup-safe way
+func frontAppAXMenuBar() -> AXUIElement? {
+    guard !model.frontApp.isEmpty,
+          let app = NSWorkspace.shared.runningApplications.first(where: {
+              $0.localizedName == model.frontApp
+                  && $0.processIdentifier != ProcessInfo.processInfo.processIdentifier
+          })
+    else { return nil }
+    let ax = AXUIElementCreateApplication(app.processIdentifier)
+    var ref: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(ax, "AXMenuBar" as CFString, &ref) == .success,
+          let bar = ref, CFGetTypeID(bar) == AXUIElementGetTypeID() else { return nil }
+    return (bar as! AXUIElement)
+}
+
+// The REAL Apple menu — child 0 of the front app's menu bar, the item
+// the app drill-down skips — through the same drill machinery, with
+// omacosy's own extras appended. Falls back to the hand-rolled rows
+// when Accessibility is not granted or AX has nothing.
+func appleMenuRows() -> [PopupRow] {
+    guard AXIsProcessTrusted(),
+          let menubar = frontAppAXMenuBar(),
+          let apple = axChildren(menubar).first
+    else { return appleRows() }
+    if !appMenuStack.isEmpty {
+        return appMenuRows()
+    }
+    var rows = rowsForMenu(apple, collapseAlternates: true)
+    guard !rows.isEmpty else { return appleRows() }
+    if rows.last?.separator != true { rows.append(PopupRow(separator: true)) }
+    rows.append(PopupRow(text: "Next Theme", dim: true, action: {
+        closePopup()
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = shell("\(NSHomeDirectory())/.local/bin/theme-next", [])
+        }
+    }))
+    return rows
+}
+
+func appMenuRows() -> [PopupRow] {
+    let opts = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+    guard AXIsProcessTrustedWithOptions(opts) else {
+        return [PopupRow(text: "grant Accessibility to omacosy-bar", hero: true),
+                PopupRow(text: "System Settings opened the pane — toggle the bar on,", dim: true),
+                PopupRow(text: "then click the app name again", dim: true)]
+    }
+    // drilled into a menu: its items, behind a back row
+    if let top = appMenuStack.last {
+        var rows = [PopupRow(icon: "‹", text: top.title, highlight: true, action: {
+            appMenuStack.removeLast()
+            refreshPopup()
+        })]
+        rows.append(contentsOf: rowsForMenu(top.element, context: top.title))
+        return rows
+    }
+    // NOT frontmostApplication: the click that opens this popup makes
+    // the bar itself frontmost for a beat, and the popup bailed empty.
+    // model.frontApp tracks the real app and ignores our own pid.
+    guard let menubar = frontAppAXMenuBar() else {
+        tlog("appmenu: no menu bar for '\(model.frontApp)'")
+        return []
+    }
+    // no hero title: the app's name is literally the pill this popup
+    // hangs from. Index 0 is the Apple menu — our apple pill's ground.
+    var rows: [PopupRow] = []
+    for item in axChildren(menubar).dropFirst() {
+        let title = axString(item, "AXTitle")
+        guard !title.isEmpty else { continue }
+        rows.append(PopupRow(icon: "›", text: title, action: {
+            appMenuStack.append((title, item))
+            refreshPopup()
+        }))
+    }
+    if !rows.isEmpty { rows[0].highlight = true }
+    return rows
 }
 
 extension String {
@@ -1439,10 +1933,11 @@ extension String {
 }
 
 // --- cheatsheet (Super+K) --------------------------------------------------
-// Rendered from the LIVE aerospace config, never from a list kept here: a
-// cheatsheet that can disagree with the keys is worse than no cheatsheet.
-// The config's own section comments become the headings, so the grouping
-// is the author's rather than a second opinion about it.
+// Rendered from the LIVE config of whichever WM is running — aerospace.toml
+// or OmniWM's settings.toml — never from a list kept here: a cheatsheet
+// that can disagree with the keys is worse than no cheatsheet. The
+// config's own section comments become the headings, so the grouping is
+// the author's rather than a second opinion about it.
 
 struct CheatEntry {
     let group: String
@@ -1486,6 +1981,10 @@ func prettyAction(_ raw: String) -> String {
 }
 
 func cheatEntries() -> [CheatEntry] {
+    omniwmActive() ? omniwmCheatEntries() : aerospaceCheatEntries()
+}
+
+func aerospaceCheatEntries() -> [CheatEntry] {
     let path = "\(NSHomeDirectory())/.config/aerospace/aerospace.toml"
     guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
     var entries: [CheatEntry] = []
@@ -1533,21 +2032,209 @@ func cheatEntries() -> [CheatEntry] {
     return entries
 }
 
+// "Control+Option+Command+Shift+1" -> "Super+Shift+1" — the same collapse
+// prettyKey does for aerospace's cmd-ctrl-alt, in OmniWM's spelling. The
+// key names arrive already capitalised; only " Arrow" is dropped, so the
+// arrows read "Left" the way the aerospace sheet prints them.
+func prettyOmniKey(_ raw: String) -> String {
+    var rest = raw
+    var parts: [String] = []
+    if rest.hasPrefix("Control+Option+Command+") {
+        parts.append("Super")
+        rest = String(rest.dropFirst("Control+Option+Command+".count))
+    }
+    for comp in rest.split(separator: "+") {
+        var key = String(comp)
+        if key.hasSuffix(" Arrow") { key = String(key.dropLast(" Arrow".count)) }
+        parts.append(key)
+    }
+    return parts.joined(separator: "+")
+}
+
+// "switchWorkspace.0" -> "switch workspace 1": the raw catalog ids were
+// printed verbatim once, on the theory that the config's truth beats a
+// pretty lie — and read as a mess (0-based suffixes beside 1-based
+// keycaps, camelCase runs). The id's meaning survives; only the casing
+// and indexing are translated to match the keycap next to it.
+func humanizeOmniId(_ id: String) -> String {
+    func words(_ s: String) -> String {
+        var out = ""
+        for ch in s { out.append(ch.isUppercase ? " " + String(ch).lowercased() : String(ch)) }
+        return out.trimmingCharacters(in: .whitespaces)
+    }
+    let parts = id.split(separator: ".", maxSplits: 1).map(String.init)
+    // dwindle reality beats the catalog's niri-flavored names: moveColumn
+    // is a tile SWAP there (the binding people reach for daily), and
+    // plain move STACKS into the neighbor as a group
+    let renamed = ["moveColumn": "swap window", "move": "stack into"]
+    let head = renamed[parts[0]] ?? words(parts[0])
+    guard parts.count > 1 else { return head }
+    if let n = Int(parts[1]) { return "\(head) \(n + 1)" }
+    switch parts[1] {
+    case "decrease10Percent": return "\(head) −10%"
+    case "increase10Percent": return "\(head) +10%"
+    default: return "\(head) \(words(parts[1]))"
+    }
+}
+
+// with the comment headings stripped by the strict-decoder rewrite, the
+// sheet gets its sections from the id families instead
+func omniGroup(_ id: String) -> String {
+    let h = String(id.split(separator: ".").first ?? "")
+    if h.lowercased().contains("workspace") { return "Workspaces" }
+    if h.hasPrefix("focus") { return "Focus" }
+    if h.hasPrefix("move") || h.hasPrefix("summon") { return "Move" }
+    if h.contains("Span") || h.hasPrefix("resize") || h.hasPrefix("balance")
+        || h.hasPrefix("cycleSize") || h.hasPrefix("set") { return "Size" }
+    if h.hasPrefix("toggle") || h.contains("Layout") || h.contains("Column")
+        || h.hasPrefix("preselect") || h.contains("olumn") { return "Layout & columns" }
+    return "System"
+}
+
+// [[hotkeys]] tables out of OmniWM's settings.toml: a binding string and
+// an action id per table, in either order.
+func omniwmCheatEntries() -> [CheatEntry] {
+    let path = "\(NSHomeDirectory())/.config/omniwm/settings.toml"
+    guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
+    var entries: [CheatEntry] = []
+    var group = ""
+    var lastWasComment = false
+    var inHotkey = false
+    var binding = ""
+    var id = ""
+    func flush() {
+        // the canonical settings file carries EVERY catalog id — most
+        // Unassigned. A cheatsheet's job is what you CAN press, so the
+        // ~90 unassigned rows stay out (they made the sheet a wall).
+        if inHotkey, !binding.isEmpty, binding != "Unassigned", !id.isEmpty {
+            entries.append(CheatEntry(
+                group: group.isEmpty ? omniGroup(id) : group,
+                key: prettyOmniKey(binding), action: humanizeOmniId(id)))
+        }
+        binding = ""
+        id = ""
+    }
+    for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        if line.hasPrefix("#") {
+            // a comment between tables starts the NEXT group: a complete
+            // pending entry belongs to the heading it was written under,
+            // not the one about to be read (a half-read table keeps its
+            // keys — TOML allows comments between them)
+            if !binding.isEmpty, !id.isEmpty { flush() }
+            // first line of a comment block is a heading, same rule as the
+            // aerospace parser — the "---" ruler decoration is trimmed off
+            if !lastWasComment {
+                var title = String(line.dropFirst())
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "- "))
+                if let c = title.firstIndex(where: { $0 == ":" || $0 == "." }) {
+                    title = String(title[..<c])
+                }
+                title = title.trimmingCharacters(in: .whitespaces)
+                if title.count > 34 { title = String(title.prefix(33)) + "…" }
+                group = title
+            }
+            lastWasComment = true
+            continue
+        }
+        lastWasComment = false
+        if line.hasPrefix("[") {
+            flush()
+            inHotkey = line == "[[hotkeys]]"
+            continue
+        }
+        guard inHotkey, let eq = line.firstIndex(of: "=") else { continue }
+        let key = line[line.startIndex..<eq].trimmingCharacters(in: .whitespaces)
+        let value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+        guard let q = value.first, q == "'" || q == "\"",
+            let close = value.dropFirst().firstIndex(of: q)
+        else { continue }
+        let v = String(value[value.index(after: value.startIndex)..<close])
+        if key == "binding" { binding = v } else if key == "id" { id = v }
+    }
+    flush()
+    // derived groups arrive interleaved (switch/move alternate per
+    // workspace) — order them section by section, keeping in-group
+    // order (index tiebreak kept explicit rather than leaning on
+    // sort stability)
+    let sectionOrder = ["Workspaces", "Focus", "Move", "Layout & columns", "Size", "System"]
+    let indexed = entries.enumerated().map { ($0.offset, $0.element) }
+    entries = indexed.sorted { a, b in
+        let ga = sectionOrder.firstIndex(of: a.1.group) ?? 99
+        let gb = sectionOrder.firstIndex(of: b.1.group) ?? 99
+        return ga != gb ? ga < gb : a.0 < b.0
+    }.map { $0.1 }
+    // the exec chords live in Karabiner while OmniWM runs (its hotkeys
+    // cannot exec) — the sheet must show them or half the muscle-memory
+    // map is invisible. Read our own injected rules back by their
+    // description prefix.
+    entries.append(contentsOf: karabinerExecCheatEntries())
+    return entries
+}
+
+// "omacosy-omniwm: terminal" rules out of karabiner.json — description
+// carries the action, from.key_code + modifiers carry the chord
+func karabinerExecCheatEntries() -> [CheatEntry] {
+    let path = "\(NSHomeDirectory())/.config/karabiner/karabiner.json"
+    guard let data = FileManager.default.contents(atPath: path),
+        let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let profiles = root["profiles"] as? [[String: Any]] else { return [] }
+    var entries: [CheatEntry] = []
+    for profile in profiles {
+        guard (profile["selected"] as? Bool) ?? (profiles.count == 1),
+            let cm = profile["complex_modifications"] as? [String: Any],
+            let rules = cm["rules"] as? [[String: Any]] else { continue }
+        for rule in rules {
+            guard let desc = rule["description"] as? String,
+                desc.hasPrefix("omacosy-omniwm: "),
+                let manips = rule["manipulators"] as? [[String: Any]],
+                let from = manips.first?["from"] as? [String: Any],
+                let keyCode = from["key_code"] as? String else { continue }
+            let mods = ((from["modifiers"] as? [String: Any])?["mandatory"] as? [String]) ?? []
+            let hasShift = mods.contains("shift")
+            let key = keyCode == "return_or_enter" ? "Enter"
+                : keyCode == "spacebar" ? "Space" : keyCode.uppercased()
+            let chord = "Super+" + (hasShift ? "Shift+" : "") + key
+            entries.append(CheatEntry(group: "Apps and system (Karabiner)",
+                key: chord, action: String(desc.dropFirst("omacosy-omniwm: ".count))))
+        }
+    }
+    return entries
+}
+
 let cheatColumns = 3
 let cheatRowH: CGFloat = 20
 let cheatPad: CGFloat = 18
 
+// the sheet takes key focus while open (the overview's pattern) so it
+// can be typed into; hideCheatsheet hands focus back to the app that
+// had it, so the search never costs the user their window
+final class CheatWindow: NSWindow {
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+    override var canBecomeKey: Bool { true }
+}
+
 final class CheatsheetView: NSView {
     var entries: [CheatEntry] = []
+    var filter = ""
     private var keyFont: NSFont { nerdFont("Bold", 12) }
     private var actFont: NSFont { nerdFont("Regular", 12) }
     private var headFont: NSFont { nerdFont("Bold", 13) }
+
+    private func visibleEntries() -> [CheatEntry] {
+        guard !filter.isEmpty else { return entries }
+        let f = filter.lowercased()
+        return entries.filter {
+            $0.key.lowercased().contains(f) || $0.action.lowercased().contains(f)
+                || $0.group.lowercased().contains(f)
+        }
+    }
 
     // rows are (heading?, entry?) laid into balanced columns
     private func rows() -> [(String?, CheatEntry?)] {
         var out: [(String?, CheatEntry?)] = []
         var seen = ""
-        for e in entries {
+        for e in visibleEntries() {
             if e.group != seen {
                 if !out.isEmpty { out.append((nil, nil)) } // breathing room
                 out.append((e.group, nil))
@@ -1600,7 +2287,9 @@ final class CheatsheetView: NSView {
         body.lineWidth = 1
         body.stroke()
 
-        let title = "keybindings — Super is Caps Lock · Super+K or click to close"
+        let title = filter.isEmpty
+            ? "keybindings — Super is Caps Lock · type to search · Super+K, Esc or click to close"
+            : "search: \(filter)▏ — \(visibleEntries().count) match\(visibleEntries().count == 1 ? "" : "es") · Esc clears"
         drawText(title, nerdFont("Bold", 12), palette.accent.withAlphaComponent(0.8),
                  leftAt: cheatPad, midY: bounds.maxY - cheatPad - 6)
 
@@ -1622,23 +2311,56 @@ final class CheatsheetView: NSView {
         }
     }
 
-    // no key focus is taken, so there is no Esc to listen for — a click
-    // is the dismissal that does not cost the user their focused window
     override func mouseDown(with event: NSEvent) { hideCheatsheet() }
+
+    override var acceptsFirstResponder: Bool { true }
+    override func keyDown(with event: NSEvent) {
+        switch event.keyCode {
+        case 53: // esc — clear an active search first, close on the second
+            if filter.isEmpty { hideCheatsheet() } else { filter = ""; refit() }
+        case 51: // backspace
+            if !filter.isEmpty { filter.removeLast(); refit() }
+        case 40 where event.modifierFlags.contains([.command, .control, .option]):
+            hideCheatsheet() // Super+K toggles closed even while we hold key
+        default:
+            guard let chars = event.charactersIgnoringModifiers,
+                !chars.isEmpty,
+                !event.modifierFlags.contains(.command),
+                chars.rangeOfCharacter(from: .alphanumerics.union(CharacterSet(charactersIn: "+- "))) != nil
+            else { return }
+            filter += chars
+            refit()
+        }
+    }
+
+    // the sheet shrinks to its matches — re-measure and keep the centre
+    private func refit() {
+        guard let window = window else { needsDisplay = true; return }
+        let size = measure()
+        let c = NSPoint(x: window.frame.midX, y: window.frame.midY)
+        frame = NSRect(origin: .zero, size: size)
+        window.setFrame(NSRect(x: c.x - size.width / 2, y: c.y - size.height / 2,
+                               width: size.width, height: size.height), display: true)
+        needsDisplay = true
+    }
 }
 
-var cheatWindow: PopupWindow?
+var cheatWindow: CheatWindow?
+var cheatPrevApp: NSRunningApplication?
 
 func hideCheatsheet() {
     cheatWindow?.orderOut(nil)
     cheatWindow = nil
+    // hand focus back to whoever had it before the sheet took key
+    cheatPrevApp?.activate()
+    cheatPrevApp = nil
 }
 
 func toggleCheatsheet() {
     if cheatWindow != nil { hideCheatsheet(); return }
     let entries = cheatEntries()
     guard !entries.isEmpty else {
-        tlog("cheatsheet: no bindings parsed from aerospace.toml")
+        tlog("cheatsheet: no bindings parsed from \(omniwmActive() ? "omniwm settings.toml" : "aerospace.toml")")
         return
     }
     let view = CheatsheetView(frame: .zero)
@@ -1649,7 +2371,7 @@ func toggleCheatsheet() {
     // full-surface thing here
     let mouse = NSEvent.mouseLocation
     let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main!
-    let window = PopupWindow(
+    let window = CheatWindow(
         contentRect: NSRect(x: screen.frame.midX - size.width / 2,
                             y: screen.frame.midY - size.height / 2,
                             width: size.width, height: size.height),
@@ -1660,7 +2382,12 @@ func toggleCheatsheet() {
     window.level = .popUpMenu
     window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
     window.contentView = view
-    window.orderFrontRegardless()
+    // take key so typing filters — remember the app that had focus, the
+    // close path activates it again
+    cheatPrevApp = NSWorkspace.shared.frontmostApplication
+    NSApp.activate(ignoringOtherApps: true)
+    window.makeKeyAndOrderFront(nil)
+    window.makeFirstResponder(view)
     cheatWindow = window
     tlog("cheatsheet: \(entries.count) bindings")
 }
@@ -1878,20 +2605,25 @@ final class BarView: NSView {
                 NSBezierPath(roundedRect: pill, xRadius: radius, yRadius: radius).fill()
             }
             let tint: NSColor = ws == surface.visible ? palette.barBG : palette.muted
-            // a workspace holding exactly one app shows that app's icon —
-            // free here, where NSRunningApplication hands the icon over,
-            // versus sketchybar's image-registration dance
-            if let app = model.soleApp[ws], let icon = appIcon(app) {
+            switch workspaceIconConfig.icon(for: ws) {
+            case .some(.glyph(let glyph)):
+                drawIcon(glyph, iconFont, tint, centeredIn: box)
+            case .some(.image(let icon)):
                 icon.draw(in: NSRect(x: box.midX - 9, y: barHeight / 2 - 9, width: 18, height: 18))
-            } else {
-                draw(String(ws.suffix(1)), chipFont, tint, centeredIn: box)
+            case .some(.unavailable), .none:
+                if let app = model.soleApp[ws], let icon = appIcon(app) {
+                    icon.draw(in: NSRect(x: box.midX - 9, y: barHeight / 2 - 9, width: 18, height: 18))
+                } else {
+                    draw(String(ws.suffix(1)), chipFont, tint, centeredIn: box)
+                }
             }
             chipRects.append((ws, slot))
             x += chipBox + chipPad * 2
         }
 
-        // front-app pill
+        // front-app pill — clickable: it drops the app's real menus
         var leftEdge = bracket.maxX
+        appPillRect = .zero
         if !model.frontApp.isEmpty {
             let textW = advance(model.frontApp, appFont)
             let pill = NSRect(x: bracket.maxX + gap, y: (barHeight - pillHeight) / 2,
@@ -1899,6 +2631,7 @@ final class BarView: NSView {
             palette.itemBG.setFill()
             NSBezierPath(roundedRect: pill, xRadius: radius, yRadius: radius).fill()
             draw(model.frontApp, appFont, palette.accent, centeredIn: pill)
+            appPillRect = pill
             leftEdge = pill.maxX
         }
 
@@ -1967,9 +2700,27 @@ final class BarView: NSView {
         return itemRects.first(where: { $0.1.contains(p) })?.0
     }
 
+    var appPillRect = NSRect.zero
+
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
+        if appPillRect != .zero, appPillRect.contains(p), let surface {
+            appMenuStack.removeAll()
+            // clicking the bar deactivated the app, which makes its menu
+            // items read disabled and presses land nowhere — hand focus
+            // straight back while our popup (never key) stays up
+            NSWorkspace.shared.runningApplications
+                .first { $0.localizedName == model.frontApp }?
+                .activate()
+            showPopup("appmenu", under: window?.convertToScreen(convert(appPillRect, to: nil)) ?? appPillRect,
+                      on: surface, alignLeft: true)
+            return
+        }
         if appleRect.contains(p), let surface {
+            appMenuStack.removeAll()
+            NSWorkspace.shared.runningApplications
+                .first { $0.localizedName == model.frontApp }?
+                .activate()
             // aligned to its LEFT edge: it is the leftmost thing on the bar,
             // so a right-aligned popup would hang off the screen
             showPopup("apple", under: window?.convertToScreen(convert(appleRect, to: nil)) ?? appleRect,
@@ -1977,7 +2728,7 @@ final class BarView: NSView {
             return
         }
         if let ws = chipRects.first(where: { $0.1.contains(p) })?.0 {
-            DispatchQueue.global(qos: .userInitiated).async { aerospace(["workspace", ws]) }
+            DispatchQueue.global(qos: .userInitiated).async { focusWorkspace(ws) }
             return
         }
         if let part = mediaRects.first(where: { $0.1.contains(p) })?.0 {
@@ -2016,9 +2767,21 @@ final class BarView: NSView {
         }
     }
 
+    // A trackpad flick delivers dozens of precise events plus a momentum
+    // tail; stepping 5% on each raced through the whole range. Momentum is
+    // dropped and precise deltas accumulate until a notch's worth of finger
+    // travel has passed — a clicky wheel already arrives one notch at a time.
+    private var scrollAccum: CGFloat = 0
+
     override func scrollWheel(with event: NSEvent) {
         guard let name = hit(event) else { return }
-        let step = event.scrollingDeltaY > 0 ? 5 : -5
+        if !event.momentumPhase.isEmpty { return }
+        if event.phase == .began { scrollAccum = 0 }
+        scrollAccum += event.scrollingDeltaY
+        let notch: CGFloat = event.hasPreciseScrollingDeltas ? 20 : 1
+        if abs(scrollAccum) < notch { return }
+        let step = scrollAccum > 0 ? 5 : -5
+        scrollAccum = 0
         switch name {
         case "volume":
             guard let v = readVolume() else { return }
@@ -2122,7 +2885,20 @@ func screenID(_ screen: NSScreen) -> CGDirectDisplayID {
 // resolved by display NAME every time the screens change. A cached id
 // answers "Invalid monitor ID" and the snapshot comes back empty, which
 // renders as the last set the bar knew, stale and silent.
-func monitorIDs() -> [String: String] { // display name -> aerospace id
+func monitorIDs() -> [String: String] { // display name -> WM monitor id
+    // OmniWM names monitors with NSScreen.localizedName (Monitor.current()
+    // in its source), so the same name join works; its ids stay opaque
+    // ("display:…") and only ever meet the query payloads they came from.
+    if omniwmActive() {
+        var map: [String: String] = [:]
+        if let list = omniQuery("displays", ["--fields", "id,name"])?["displays"]
+            as? [[String: Any]] {
+            for d in list {
+                if let id = d["id"] as? String, let name = d["name"] as? String { map[name] = id }
+            }
+        }
+        return map
+    }
     var map: [String: String] = [:]
     for line in aerospace(["list-monitors", "--format", "%{monitor-id}|%{monitor-name}"])
         .split(separator: "\n") {
@@ -2133,20 +2909,21 @@ func monitorIDs() -> [String: String] { // display name -> aerospace id
 }
 
 func rebuildSurfaces() {
+    let wm = omniwmActive() ? "omniwm" : "aerospace"
     let ids = monitorIDs()
     var kept: [BarSurface] = []
     for screen in NSScreen.screens {
         guard let id = ids[screen.localizedName] else { continue }
         if let existing = surfaces.first(where: { screenID($0.screen) == screenID(screen) }) {
             if existing.monitorID != id {
-                tlog("monitor: \(screen.localizedName) is now aerospace monitor \(id) (was \(existing.monitorID))")
+                tlog("monitor: \(screen.localizedName) is now \(wm) monitor \(id) (was \(existing.monitorID))")
                 existing.monitorID = id
             }
             existing.screen = screen
             existing.place()
             kept.append(existing)
         } else {
-            tlog("surface: \(screen.localizedName) -> aerospace monitor \(id)\(screen.safeAreaInsets.top > 0 ? " (notched)" : "")")
+            tlog("surface: \(screen.localizedName) -> \(wm) monitor \(id)\(screen.safeAreaInsets.top > 0 ? " (notched)" : "")")
             kept.append(BarSurface(screen: screen, monitorID: id))
         }
     }
@@ -2193,6 +2970,15 @@ func safeTop(for display: CGRect) -> CGFloat {
 
 func fullscreenDisplays() -> Set<CGDirectDisplayID> {
     var covered: Set<CGDirectDisplayID> = []
+    // Under OmniWM the width test below cannot separate a tiled window
+    // from a fullscreen one: its 0.6.3 dwindle applies no outer gaps
+    // (resolved settings say 42, layout applies 0 — upstream bug, see
+    // docs/omniwm-port.md), so ordinary tiles take the side gaps too
+    // and EVERYTHING reads as fullscreen — the bar lived in
+    // hover-reveal permanently. Until the gap bug is fixed the bar
+    // stays visible under OmniWM, accepting that it overlaps a real
+    // fullscreen window instead of ducking away.
+    if omniwmActive() { return covered }
     guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]
     else { return covered }
     var ids = [CGDirectDisplayID](repeating: 0, count: 8)
@@ -2260,7 +3046,13 @@ func pointerAtScreenTop() {
     else { return }
     let fromTop = screen.frame.maxY - p.y
     if fromTop <= revealEdge {
-        setRevealed(true)
+        // Climb only when fullscreen actually hides the bar. Otherwise stay
+        // at the -20 resting level so the auto-hidden native menu bar can
+        // slide in ABOVE the bar and stay clickable — app menus are
+        // unreachable by mouse without this.
+        if fullscreenDisplays().contains(screenID(screen)) {
+            setRevealed(true)
+        }
     } else if revealed, openPopup == nil, fromTop > barHeight + 12 {
         // a popup keeps it up: its anchor must not vanish under the pointer
         setRevealed(false)
@@ -2342,6 +3134,143 @@ watch(wsPath, create: true) {
     tlog(String(format: "switch %@ %.2f ms", ws, ms))
 }
 
+// --- omniwm fast path -------------------------------------------------------
+// OmniWM has no exec-on-workspace-change hook to write the file above,
+// and a switch between two EMPTY workspaces moves no windows, so SkyLight
+// says nothing either. OmniWM publishes instead: its active-workspace
+// channel emits one event per change. `watch … --exec /bin/cat` rather
+// than `subscribe` because subscribe pretty-prints multi-line JSON while
+// watch hands its child exactly one NDJSON line per event, and the child
+// inherits this pipe (OmniWM docs/IPC-CLI.md, "watch") — so the stream
+// arrives line-delimited and the bar's side never forks anything.
+
+var omniWatch: Process?
+var omniWatchBuffer = Data()
+
+func omniWorkspaceBarEvent(_ line: Data) {
+    // The workspace-bar channel, not active-workspace: measured 2026-08-29,
+    // active-workspace (and focus) only fire when the FOCUSED WINDOW
+    // changes, so every switch to or from an EMPTY workspace is silent —
+    // OmniWM's own Super+8/9 left the pill frozen. Their bar highlights
+    // empties, so its scene channel fires on every switch, and carries
+    // per-monitor active flags plus each workspace's windows (occupancy
+    // and the sole-app icon come free, no windows query).
+    guard let root = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+          root["channel"] as? String == "workspace-bar",
+          let payload = (root["result"] as? [String: Any])?["payload"] as? [String: Any],
+          let monitors = payload["monitors"] as? [[String: Any]]
+    else { return }
+    let current = payload["interactionMonitorId"] as? String ?? ""
+    let t0 = DispatchTime.now().uptimeNanoseconds
+    var changed = false
+    var occupied = Set<String>()
+    var sole: [String: String] = [:]
+    var focusedNow = ""
+    for m in monitors {
+        guard let id = m["id"] as? String,
+              let list = m["workspaces"] as? [[String: Any]] else { continue }
+        var active = ""
+        for w in list {
+            guard let name = w["rawName"] as? String else { continue }
+            if (w["isFocused"] as? Bool) == true { active = name }
+            let wins = ((w["windows"] as? [[String: Any]]) ?? [])
+                .filter { ($0["appName"] as? String)?.hasPrefix("omacosy") != true }
+            if !wins.isEmpty {
+                occupied.insert(name)
+                let apps = Set(wins.compactMap { $0["appName"] as? String })
+                if apps.count == 1, let app = apps.first { sole[name] = app }
+            }
+        }
+        guard !active.isEmpty else { continue }
+        if id == current { focusedNow = active }
+        for surface in surfaces where surface.monitorID == id && surface.visible != active {
+            surface.visible = active
+            changed = true
+        }
+    }
+    if !focusedNow.isEmpty, model.focused != focusedNow { model.focused = focusedNow; changed = true }
+    if model.occupied != occupied { model.occupied = occupied; changed = true }
+    if model.soleApp != sole { model.soleApp = sole; changed = true }
+    guard changed else { return }
+    repaint()
+    kickVisibility()
+    tlog(String(format: "switch %@ %.2f ms (omniwm)", focusedNow,
+                Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000))
+}
+
+func startOmniWatch() {
+    guard omniWatch == nil, omniwmActive() else { return }
+    // a bar killed by launchd (kickstart -k is SIGKILL) leaves its
+    // stream child alive under pid 1, one per restart — reap orphans
+    // before spawning ours; -P 1 cannot touch a living bar's child
+    let reap = Process()
+    reap.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+    reap.arguments = ["-P", "1", "-f", "omniwmctl watch workspace-bar"]
+    try? reap.run()
+    reap.waitUntilExit()
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: omniwmctlBin)
+    p.arguments = ["watch", "workspace-bar", "--exec", "/bin/cat"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    pipe.fileHandleForReading.readabilityHandler = { handle in
+        let chunk = handle.availableData
+        guard !chunk.isEmpty else { return }
+        DispatchQueue.main.async {
+            omniWatchBuffer.append(chunk)
+            while let nl = omniWatchBuffer.firstIndex(of: 0x0A) {
+                let line = Data(omniWatchBuffer[omniWatchBuffer.startIndex..<nl])
+                omniWatchBuffer = Data(omniWatchBuffer[omniWatchBuffer.index(after: nl)...])
+                omniWorkspaceBarEvent(line)
+            }
+        }
+    }
+    p.terminationHandler = { proc in
+        DispatchQueue.main.async {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            guard omniWatch === proc else { return } // a newer watch took over
+            omniWatch = nil
+            // OmniWM restarting, or its IPC server not up yet, drops the
+            // stream: keep knocking while OmniWM is the one running
+            guard omniwmActive() else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { startOmniWatch() }
+        }
+    }
+    guard (try? p.run()) != nil else { return }
+    omniWatch = p
+    tlog("omniwm: watching workspace-bar")
+}
+
+func stopOmniWatch() {
+    guard let p = omniWatch else { return }
+    omniWatch = nil // before terminate, so the handler cannot restart it
+    p.terminate()
+}
+
+// The WM itself can change under the bar: omacosy-wm-switch quits one and
+// launches the other, and OmniWM.app appearing or vanishing is the
+// signal. Monitor ids have to be re-resolved — the two WMs name the same
+// display differently ("2" vs "display:…") — and the retries cover the
+// incoming WM still booting when the first attempt asks; a switch that
+// reverts fires this again from the other side.
+for event in [NSWorkspace.didLaunchApplicationNotification,
+              NSWorkspace.didTerminateApplicationNotification] {
+    NSWorkspace.shared.notificationCenter.addObserver(forName: event, object: nil, queue: .main) { note in
+        guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+              app.bundleIdentifier == omniwmBundleID else { return }
+        let launched = event == NSWorkspace.didLaunchApplicationNotification
+        tlog("wm: OmniWM \(launched ? "launched" : "quit")")
+        if launched { startOmniWatch() } else { stopOmniWatch() }
+        for delay in [1.0, 3.0, 8.0, 15.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                rebuildSurfaces()
+                kickRebuild()
+            }
+        }
+    }
+}
+
 // front app: a notification, not a poll and not a script
 NSWorkspace.shared.notificationCenter.addObserver(
     forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
@@ -2384,12 +3313,26 @@ NotificationCenter.default.addObserver(
         rebuildSurfaces()
         applyShade() // a new display arrives at full output
         kickRebuild()
+        // the 1 s grace can still lose the race with the WM adopting
+        // the new display — its monitor id resolves to nothing and the
+        // screen stays barless (the Dell did, on replug). Same retry
+        // ladder the WM-switch path uses.
+        for delay in [3.0, 8.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                rebuildSurfaces()
+                applyShade()
+                kickRebuild()
+            }
+        }
         let now = NSScreen.screens.count
         guard now != monitorCount else { return }
         let wasSingle = monitorCount == 1
         monitorCount = now
         let op = now == 1 ? "collapse" : (wasSingle ? "restore" : "")
         guard !op.isEmpty else { return }
+        // both WMs: OmniWM re-routes guest WORKSPACES on unplug but
+        // strands their windows "after 9" — ws-collapse has an omniwm
+        // branch that folds and restores them through omacosy-omni
         tlog("displays: \(now) — running ws-collapse \(op)")
         // off-main: it shells out to aerospace per window, and restore
         // deliberately sleeps while aerospace re-adopts the monitor
@@ -2650,8 +3593,8 @@ for event in [NSWorkspace.didLaunchApplicationNotification,
 func scheduleClock() {
     updateClock()
     let now = Date()
-    let nextMinute = Calendar.current.date(bySetting: .second, value: 0,
-                                           of: now.addingTimeInterval(60)) ?? now.addingTimeInterval(60)
+    let nextMinute = Calendar.current.nextDate(after: now, matching: DateComponents(second: 0),
+                                               matchingPolicy: .nextTime) ?? now.addingTimeInterval(60)
     DispatchQueue.main.asyncAfter(deadline: .now() + max(1, nextMinute.timeIntervalSinceNow)) { scheduleClock() }
 }
 scheduleClock()
@@ -2661,11 +3604,16 @@ Timer.scheduledTimer(withTimeInterval: 1800, repeats: true) { _ in updateWeather
 // --- go -------------------------------------------------------------------
 
 model.frontApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
-model.focused = aerospace(["list-workspaces", "--focused"])
-    .trimmingCharacters(in: .whitespacesAndNewlines)
+// startup only: from here the fast paths keep it — the hook file under
+// aerospace, the watch stream under omniwm
+model.focused = omniwmActive()
+    ? ((omniQuery("workspaces", ["--focused", "--fields", "raw-name"])?["workspaces"]
+        as? [[String: Any]])?.first?["rawName"] as? String ?? "")
+    : aerospace(["list-workspaces", "--focused"])
+        .trimmingCharacters(in: .whitespacesAndNewlines)
 rebuildSurfaces()
 guard !surfaces.isEmpty else {
-    FileHandle.standardError.write("omacosy-bar: no display matched an aerospace monitor\n".data(using: .utf8)!)
+    FileHandle.standardError.write("omacosy-bar: no display matched \(omniwmActive() ? "an omniwm" : "an aerospace") monitor\n".data(using: .utf8)!)
     exit(1)
 }
 apply(fetchSnapshot()) // blocking is fine here: the run loop has not started
@@ -2677,5 +3625,6 @@ updateWifi()
 updateWeather()
 repaint()
 primeMedia()
+startOmniWatch() // a no-op under aerospace; the WM observer handles switches
 tlog("omacosy-bar up on " + surfaces.map { "\($0.screen.localizedName)=m\($0.monitorID)\($0.notched ? " (notched)" : "")" }.joined(separator: ", "))
 app.run()

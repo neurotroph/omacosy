@@ -52,6 +52,7 @@
         }
     ],
     "global": {
-        "show_in_menu_bar": false
+        "show_in_menu_bar": false,
+        "enable_notification_window": false
     }
 }

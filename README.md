@@ -14,7 +14,7 @@ this one repo.
 The whole environment idles at about **157MB** of memory. Numbers per
 process in [Memory use](#memory-use).
 
-Most of it is five small signed Swift binaries built by the installer,
+Most of it is seven small signed binaries (Swift and C) built by the installer,
 because several of the existing tools are broken on macOS 26. The
 details are under [What's inside](#whats-inside).
 
@@ -73,9 +73,9 @@ grant hide themselves rather than half-work.
 
 | Grant | Who asks | What it does | Without it |
 |---|---|---|---|
-| **Accessibility** | AeroSpace, AerospaceSwipe, `omacosy-ffm` | Move, resize and focus other apps' windows. This is the tiling itself, and it is the broadest permission here. | Nothing tiles. Not optional in practice. |
-| **Input Monitoring** | Karabiner-Elements, AerospaceSwipe | Karabiner reads keys to remap Caps Lock; AerospaceSwipe reads raw trackpad contacts, because macOS 26 stopped carrying touch data in normal events. | No Super key, no swipe gestures. |
-| **Screen Recording** | `omacosy-overview` | Captures a thumbnail per window for the overview cards, including windows AeroSpace has stashed offscreen. A screenshot of the visible screen could not see those. | Cards fall back to app icons and titles. |
+| **Accessibility** | AeroSpace *or* OmniWM, `omacosy-gesture`, `omacosy-bar` (reads the focused app's menus for the app-pill popup), `omacosy-ffm` (AeroSpace mode only) | Move, resize and focus other apps' windows. This is the tiling itself, and it is the broadest permission here. | Nothing tiles. Not optional in practice. |
+| **Input Monitoring** | Karabiner-Elements, `omacosy-gesture` (and OmniWM, under that option) | Karabiner reads keys to remap Caps Lock; `omacosy-gesture` reads raw trackpad contacts, because macOS 26 stopped carrying touch data in normal events. | No Super key, no swipe gestures. |
+| **Screen Recording** | `omacosy-overview` | Captures a thumbnail per window for the overview cards, including windows the window manager has stashed offscreen. A screenshot of the visible screen could not see those. | Cards fall back to app icons and titles. |
 | **Bluetooth** | `omacosy-bar` | Reads adapter power and the paired-device list for the bluetooth pill and its menu. | The pill hides itself. |
 | **Location** | `omacosy-bar` | Reads **only** the wi-fi network's name, which macOS classes as location data. No coordinate is ever requested; the authorisation itself is what unlocks `CWInterface.ssid()`. | The wi-fi popup's title row reads "wi-fi" instead of your network's name. Everything else is unaffected. |
 | **Automation** | `omacosy-bar`, `theme-set` | Apple Events to **Spotify** (what is playing; play/pause/next from the media pill) and to **System Events** (sleep, lock and restart from the Apple menu; setting the wallpaper). | The media pill hides; those menu rows do nothing. |
@@ -109,17 +109,9 @@ Refuse the grant and you lose the name, nothing else.
   during install is. It is the most privileged thing this repo puts on
   your Mac, and it is third-party. Skip it if that trade is wrong for
   you; you lose the Super key and keep everything else.
-- **One third-party program is built from source here, at a pinned
-  commit.** aerospace-swipe is compiled by `install.sh`, gets
-  Accessibility and Input Monitoring, and is then signed with your own
-  Apple Development identity so those grants survive rebuilds — which
-  is exactly why the commit is pinned in `install.sh` (`SWIPE_COMMIT`)
-  rather than tracking upstream's default branch. Bumping it is a
-  deliberate edit, and the patches in `patches/` are verified against
-  that tree.
 - **Nothing here reads your keystrokes.** No omacosy binary opens a
   keyboard event tap. Only Karabiner sees keys, which is inherent to
-  remapping one. AerospaceSwipe's event tap is gesture-only and
+  remapping one. `omacosy-gesture`'s event tap is gesture-only and
   listen-only (`1 << NSEventTypeGesture`, `kCGEventTapOptionListenOnly`),
   so it cannot see or alter a keystroke. Debug logs live in
   `~/.local/state/omacosy/run/` (mode 700, so only you can read them);
@@ -151,15 +143,15 @@ Your personal shell config belongs in `~/.zshrc.local`; the repo's
 
 | Piece | Tool | Config |
 |---|---|---|
-| Tiling WM | [AeroSpace](https://github.com/nikitabobko/AeroSpace) | `config/aerospace/aerospace.template.toml` |
+| Tiling WM | [AeroSpace](https://github.com/nikitabobko/AeroSpace) *or* [OmniWM](https://github.com/BarutSRB/OmniWM) via `omacosy-wm-switch` | `config/aerospace/aerospace.template.toml`, `config/omniwm/settings.toml` |
 | Super key | [Karabiner](https://karabiner-elements.pqrs.org) (Caps Lock → cmd+ctrl+alt) | `config/karabiner/` (copied, not symlinked — TCC) |
 | Status bar, popups, shade | `omacosy-bar` (self-compiled launchd agent, one process draws all of it) | `helper/bar.swift` |
 | Window borders + fullscreen shroud | `omacosy-borders` (self-compiled launchd agent) | `helper/borders.swift`, `config/borders.conf` |
-| Focus follows mouse | `omacosy-ffm` (self-compiled launchd agent) | `helper/ffm.swift`, `config/ffm-ignore` |
-| Trackpad swipes | [aerospace-swipe](https://github.com/acsandmann/aerospace-swipe) + our patch | `config/aerospace-swipe/config.json`, `patches/` |
+| Focus follows mouse | `omacosy-ffm` (self-compiled launchd agent; parked under OmniWM, whose native ffm takes over) | `helper/ffm.swift`, `config/ffm-ignore` |
+| Trackpad gestures | `omacosy-gesture` (self-compiled launchd agent; engine absorbed from [aerospace-swipe](https://github.com/acsandmann/aerospace-swipe), MIT) | `helper/gesture/`, `config/gesture/` (live copy: `~/.config/omacosy/gesture.json`) |
 | Workspace overview | `omacosy-overview` (self-compiled resident daemon) | `helper/overview.swift` |
-| Dwindle split direction | `on-focus-changed` hook running `omacosy-helper split-hint` (no daemon) | `config/aerospace/aerospace.template.toml`, `helper/main.swift` |
-| Workspace / window navigation | `omacosy-ws`, `omacosy-cycle`, `omacosy-float` | `bin/` |
+| Dwindle split direction | AeroSpace: `on-focus-changed` hook running `omacosy-helper split-hint`; OmniWM: native dwindle + a preselect in `omacosy-spawn` (omarchy's right/below insertion) | `config/aerospace/aerospace.template.toml`, `helper/main.swift` |
+| Workspace / window navigation | `omacosy-ws`, `omacosy-cycle`, `omacosy-float`, `omacosy-wm-switch`; under OmniWM all of it rides `omacosy-omni`, a held-socket IPC client | `bin/`, `helper/gesture/omniwm.c` |
 | Terminal look & spawn size | Ghostty (hidden titlebar; new windows spawn small so tiling never flashes full-screen) | `config/ghostty/config` |
 | Park/restore the stack | `omacosy-toggle` | `bin/omacosy-toggle` |
 | System glue | `omacosy-helper` (self-compiled) | `helper/main.swift` |
@@ -173,10 +165,13 @@ Why so much of it is self-built:
   `omacosy-ffm` focuses windows through the same SkyLight calls
   AeroSpace uses.
 - **aerospace-swipe** broke because CGEvent taps stopped carrying
-  multi-touch data. The patched version reads raw MultitouchSupport
-  frames; the fixes are offered upstream as
+  multi-touch data on macOS 26.3. We fixed it (raw MultitouchSupport
+  frames) and offered the fixes upstream as
   [#29](https://github.com/acsandmann/aerospace-swipe/pull/29) and
-  [#30](https://github.com/acsandmann/aerospace-swipe/pull/30).
+  [#30](https://github.com/acsandmann/aerospace-swipe/pull/30); once
+  the daemon had to serve both window managers and carried more of
+  our patches than upstream commits, the engine moved in-tree as
+  `omacosy-gesture` (MIT notice kept).
 - **JankyBorders** keeps a bitmap per window and costs hundreds of MB.
   `omacosy-borders` strokes one CAShapeLayer that the WindowServer
   rasterizes, driven by SkyLight notifications for focus, move and
@@ -204,13 +199,64 @@ One process draws all of it: bar, popups and sliders are surfaces of
 A popup stays open while the pointer is anywhere in the bar or the
 popup, and closes when it is in neither. The bar hides itself when a
 window takes the whole display, and comes back if you put the pointer
-on the very top edge, the way the menu bar does, so brightness and
-volume stay reachable mid-film without leaving fullscreen. While
-revealed it climbs above the fullscreen window and drops back behind
-everything when the pointer leaves.
+on the very top edge, so brightness and volume stay reachable mid-film
+without leaving fullscreen. The climb happens only when a fullscreen
+window actually covers the bar — otherwise the top edge belongs to the
+auto-hidden native menu bar, which reveals ABOVE the bar and stays
+clickable (app menus were unreachable before that fix). It drops back
+behind everything when the pointer leaves. Under OmniWM the bar simply
+stays visible in its reserved strip and never plays this game.
 
-- **Apple menu**: About, System Settings, Lock, Sleep, Restart, Shut
-  Down, Next Theme (the menu the hidden native bar took away).
+If the native menu bar ever gets stuck revealed over the bar (a
+Tahoe bug, most often poked by a Focus mode's menu-bar icon),
+`killall SystemUIServer` resets it.
+
+### Workspace icons
+
+You can set workspace icons in the optional
+`~/.config/omacosy/workspace-icons.conf` file. Each non-comment line has one
+workspace name, an equals sign, and either one Unicode scalar or a reverse-DNS
+application bundle identifier.
+
+```
+1 = ★
+14 = ◆
+
+4 = com.apple.Safari
+```
+
+The bar first uses a configured icon. It then uses the icon of the sole app on
+that workspace, and finally shows the workspace's last digit. Exact workspace
+names win. In this example, workspace `14` uses `◆`, not the `4` shorthand.
+The shorthand applies only to multi-digit, all-numeric workspace names ending
+in `1` through `9` when they have no valid exact declaration.
+
+The bar reads the file once at startup. To apply an edit, restart it with:
+
+```sh
+launchctl kickstart -k "gui/$(id -u)/com.omacosy.bar"
+```
+
+Malformed lines are logged and ignored. A well-formed bundle identifier that
+does not resolve to an installed app is unavailable. It blocks shorthand for
+that exact workspace, then the bar falls back to the sole app or the digit.
+Image paths are unsupported because the bar resolves configured app icons at
+startup and does no config-file or image-file I/O while it draws.
+
+- **Apple menu**: the REAL one, read over Accessibility — About This
+  Mac, System Settings, Recent Items (drills in, with app and
+  file-type icons resolved locally since AX exposes none), Force Quit,
+  the power verbs — plus omacosy's Next Theme at the bottom. Hidden
+  hold-Option duplicates are collapsed; falls back to a hand-rolled
+  list without the Accessibility grant.
+- **App menus**: clicking the front-app pill drops that app's actual
+  menu bar into a popup — File/Edit/… drill into their real items,
+  nested submenus included, and clicking a leaf performs it directly
+  via AXPress with no native menu ever appearing. Shortcuts sit
+  right-aligned; enabled-state is not rendered because apps validate
+  menu items only when a menu opens, so closed-menu reads lie. Menus
+  taller than the screen scroll. The one thing the auto-hidden native
+  bar still owned, gone.
 - **Workspaces**: one segmented capsule per monitor showing only that
   monitor's workspaces; accent pill on the focused one; click to jump.
 - **Media**: prev / play-pause / next + track title (Spotify). Centered
@@ -257,7 +303,7 @@ typing or app shortcuts. Caps Lock tapped alone is Escape.
 | `Super+arrows` | focus the window in that direction |
 | `Super+s` | surface the next floating window (and bring the cursor) |
 | **Moving windows** | |
-| `Super+shift+arrows` | move the window in that direction |
+| `Super+shift+arrows` | AeroSpace: move the window in that direction. OmniWM: **swap** tiles (`ctrl+opt+shift+arrows` stacks into the neighbor as a group instead) |
 | `Super+shift+1..9` | move the window to workspace N and follow it |
 | `Super+shift+o` | throw the window to the same slot on the other display |
 | `Super+shift+space` | throw the WHOLE workspace to the other display |
@@ -268,11 +314,11 @@ typing or app shortcuts. Caps Lock tapped alone is Escape.
 | `Super+-` / `Super+=` | resize |
 | `Super+f` | fullscreen — on notched displays the camera strip is blacked out so it reads as true fullscreen, while the window stays in its workspace (swipes still reach it) |
 | `Super+n` | native macOS fullscreen (a separate Space — outside the workspace model, avoid unless an app needs it) |
-| `Super+r` | resize mode (`h/j/k/l`, `-`/`=`, `esc`) |
+| `Super+r` | resize mode (`h/j/k/l`, `-`/`=`, `esc`) — AeroSpace only; OmniWM has no binding modes |
 | `Super+shift+;` | service mode (`esc` reload, `r` flatten, `⌫` close others) |
 | **Apps and system** | |
 | `Super+enter` / `Super+shift+enter` | terminal / browser |
-| `Super+space` | launcher (Raycast) |
+| `Super+space` | launcher (Raycast; the OmniWM option opens OmniWM's command palette instead) |
 | `Super+shift+f` / `+m` / `+g` | files / music / messenger (set in `apps.conf`) |
 | `Super+shift+t` | next theme |
 | `Super+shift+b` | next wallpaper of the current theme |
@@ -375,9 +421,50 @@ off. Instead the bar grows a pill whenever the focused workspace holds
 floats, and **Super+S** or a click on that pill surfaces the next one
 and brings the cursor with it.
 
+## Two window managers (OmniWM option, beta)
+
+AeroSpace is the default. [OmniWM](https://github.com/BarutSRB/OmniWM)
+is a newer, signed-and-notarized tiling WM with a native dwindle
+layout — omacosy can run on either, and switching is one command:
+
+```sh
+omacosy-wm-switch omniwm      # installs OmniWM on first use, then
+                              # switches with a guarded handover
+omacosy-wm-switch aerospace   # the way back
+```
+
+The switch is deliberately paranoid: it snapshots your windows, waits
+for you to grant OmniWM's permissions, and requires you to confirm
+within 90 seconds that workspace switching works — anything else
+reverts to AeroSpace automatically and puts your windows back.
+
+Under OmniWM everything keeps working — bar, overview (with
+type-to-search), gestures, keybindings, themes — and the dwindle
+layout is native, so the split-hint machinery below simply isn't
+needed there. What changes: OmniWM draws the focus border (themed by
+theme-set), app-launching chords run through Karabiner rules that the
+switch installs and removes, and Super+Space opens OmniWM's command
+palette instead of Raycast.
+
+Under OmniWM the plumbing changes shape: `Super+N`/`Hyper+N` route
+through Karabiner into `omacosy-omni` (a held-socket IPC client) so
+slots resolve on the display under your cursor — OmniWM's native
+hotkeys are name-global and would always hit the main set — at the
+cost of ~40 ms per chord. `Hyper+arrows` swap tiles; OmniWM's own
+directional move *stacks* windows into a group, which stays available
+on `ctrl+opt+shift+arrows`.
+
+Honesty section: this option is daily-driven on the author's desk
+(0.6.4, docked multi-monitor, each display running its own nine
+workspaces), and docs/omniwm-port.md carries a ledger of upstream
+quirks found while porting — read it before assuming a weird layout is
+omacosy's fault. AeroSpace remains the longer-tested default.
+
 ## Focus follows mouse & swipes
 
-`omacosy-ffm`: hover focuses, with no raise over floating windows, so
+Under the OmniWM option this daemon is parked: OmniWM's native
+focus-follows-mouse (with warp-to-focus and hover-raise) replaces it.
+Under AeroSpace, `omacosy-ffm`: hover focuses, with no raise over floating windows, so
 floats stay in front. It is event-driven off mouse movement, so a
 parked cursor never steals focus from a launching window. It never
 changes focus during drags, and never through an always-on-top panel:
@@ -404,11 +491,17 @@ to jump; empty workspaces show as small chips, and digits work for them
 too. **Swipe down**, Esc, or a backdrop click dismisses. It is a
 resident daemon, so it opens instantly.
 
+**Type to search** while it is open: a search pill filters cards to
+matching window titles and apps as you type, `Enter` jumps to the
+first hit, `Esc` clears the filter before it closes the overview.
+Digits type into an active filter instead of switching, so numeric
+titles stay reachable.
+
 **Drag a card** to reorganize: the row makes room as you move, and the
 drop slides everything between the old and new position over by one.
-AeroSpace workspaces cannot be renamed or resequenced (the name is the
-position), so what actually moves is their windows, which means a split
-layout inside a moved workspace comes back as a flat row. Dropping a
+Workspaces cannot be renamed or resequenced in either WM (the name is
+the position), so what actually moves is their windows, which means a
+split layout inside a moved workspace comes back as a flat row. Dropping a
 card on an empty chip moves that workspace there instead.
 
 ## Parking the setup
@@ -420,10 +513,12 @@ stops managing, all daemons and the bar stop) without uninstalling;
 ## Memory use
 
 About **157MB** of physical footprint (what Activity Monitor calls
-Memory) across WM, bar, three background daemons, the swipe daemon and
+Memory) across WM, bar, three background daemons, the gesture daemon and
 Karabiner, measured docked to a second display. Resident set size reads
 ~322MB, but RSS counts each process's share of the same shared system
 frameworks more than once, so footprint is the number to compare.
+(Measured in AeroSpace mode; OmniWM mode is a wash — its ~44MB WM
+replaces AeroSpace plus the parked `omacosy-ffm`.)
 Largest first:
 
 | | footprint | RSS |
@@ -433,7 +528,7 @@ Largest first:
 | AeroSpace | 24MB | 85MB |
 | Karabiner (4 processes) | 24MB | 61MB |
 | `omacosy-borders` | 19MB | 29MB |
-| aerospace-swipe | 13MB | 22MB |
+| `omacosy-gesture` | 13MB | 22MB |
 | `omacosy-ffm` | 10MB | 24MB |
 
 On one display the same set measured ~155MB; the bar and the border
@@ -467,4 +562,5 @@ MIT (see `LICENSE`). Standing on: [omarchy](https://omarchy.org)
 [AeroSpace](https://github.com/nikitabobko/AeroSpace),
 [Karabiner-Elements](https://karabiner-elements.pqrs.org),
 [aerospace-swipe](https://github.com/acsandmann/aerospace-swipe) (MIT;
-patched here for macOS 26, fixes offered upstream).
+its gesture engine lives on here as `omacosy-gesture`, notice kept in
+`helper/gesture/`).
