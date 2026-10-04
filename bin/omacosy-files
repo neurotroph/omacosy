@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# omacosy-files — open yazi, a file manager, in a new Ghostty window.
+#
+# Bound to Super+Shift+Y under both window managers, and only where yazi is
+# installed: install.sh leaves the AeroSpace binding out and
+# omacosy-karabiner-omniwm leaves the OmniWM rule out otherwise. Finder keeps
+# Super+Shift+F; this is the other kind of file manager.
+set -euo pipefail
+
+notify() { /usr/bin/osascript -e "display notification \"$1\" with title \"omacosy\"" >/dev/null 2>&1 || true; }
+
+YAZI="$(command -v yazi 2>/dev/null || true)"
+[ -n "$YAZI" ] || YAZI=/opt/homebrew/bin/yazi
+GHOSTTY=/Applications/Ghostty.app/Contents/MacOS/ghostty
+[ -x "$GHOSTTY" ] || GHOSTTY="$HOME/Applications/Ghostty.app/Contents/MacOS/ghostty"
+# a keybinding has no terminal to complain into, under either window manager
+[ -x "$YAZI" ] || { notify "yazi is not installed: brew install yazi, then ./install.sh"; exit 1; }
+[ -x "$GHOSTTY" ] || { notify "Super+Shift+Y opens yazi in Ghostty, which is not installed"; exit 1; }
+
+# Through omacosy-spawn, like Super+Enter: the same split side and the same
+# burst ordering. `ghostty -e` lives as long as its window, so it is
+# backgrounded inside the command: the spawn sees the window arrive and
+# releases its lock instead of holding it for the whole yazi session.
+exec "$HOME/.local/bin/omacosy-spawn" --cmd /bin/sh -c "\"$GHOSTTY\" -e \"$YAZI\" >/dev/null 2>&1 &"

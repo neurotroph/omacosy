@@ -237,18 +237,6 @@ func focus(pid: pid_t, rect: CGRect, allowRaise: Bool) {
     }
 }
 
-guard AXIsProcessTrustedWithOptions(
-    ["AXTrustedCheckOptionPrompt": true] as CFDictionary) else {
-    FileHandle.standardError.write("omacosy-ffm: waiting for Accessibility permission…\n".data(using: .utf8)!)
-    // poll until granted, then continue
-    while !AXIsProcessTrusted() { Thread.sleep(forTimeInterval: 1) }
-    exit(2) // relaunch (launchd KeepAlive) so the grant applies cleanly
-}
-
-// Shared by motion events and the dwell confirmation: hit-test the
-// cursor and either focus (dwell confirmed) or arm the dwell timer.
-// The timer path exists because events stop when the cursor stops —
-// "glide into a window and rest" must still confirm ~100ms later.
 // Runtime files live under ~/.local/state (mode 700), never in /tmp:
 // a world-writable directory means any other local uid can plant a
 // symlink at one of these predictable names and have this process
@@ -261,9 +249,51 @@ let runDir: String = {
     return d
 }()
 
+// A running process does not see a grant made after it started (measured
+// on macOS 27.2: polling AXIsProcessTrusted stayed false), so a process
+// without the grant exits and launchd's KeepAlive starts a fresh one,
+// about every 10 s. The dialog comes once: the marker file remembers it.
+let promptedFlag = "\(runDir)/ffm-prompted"
+let prompted = FileManager.default.fileExists(atPath: promptedFlag)
+guard AXIsProcessTrustedWithOptions(
+    ["AXTrustedCheckOptionPrompt": !prompted] as CFDictionary) else {
+    if !prompted {
+        FileManager.default.createFile(atPath: promptedFlag, contents: nil)
+        FileHandle.standardError.write("omacosy-ffm: waiting for Accessibility permission…\n".data(using: .utf8)!)
+    }
+    Thread.sleep(forTimeInterval: 5)
+    exit(2)
+}
+// granted: a later revocation shows the dialog again
+try? FileManager.default.removeItem(atPath: promptedFlag)
+
+// Shared by motion events and the dwell confirmation: hit-test the
+// cursor and either focus (dwell confirmed) or arm the dwell timer.
+// The timer path exists because events stop when the cursor stops —
+// "glide into a window and rest" must still confirm ~100ms later.
 let overlayFlag = "\(runDir)/overlay-active"
 
+// OmniWM has its own focus-follows-mouse, and the two fight. launchd
+// starts this agent at every login whichever manager runs, so it stands
+// down by itself while OmniWM runs, however it was started.
+let omniwmBundleID = "com.barut.OmniWM"
+// Cached for 0.5 s, as in borders.swift: process() runs up to ~25 times a
+// second while the mouse moves, and the lookup walks every running app.
+var omniwmCached = false
+var omniwmCheckedAt = Date.distantPast
+func omniwmRunning() -> Bool {
+    if Date().timeIntervalSince(omniwmCheckedAt) < 0.5 { return omniwmCached }
+    omniwmCheckedAt = Date()
+    omniwmCached = !NSRunningApplication.runningApplications(withBundleIdentifier: omniwmBundleID).isEmpty
+    return omniwmCached
+}
+
 func process(confirmed: Bool) {
+    if omniwmRunning() {
+        pendingKey = ""
+        dwellWork?.cancel()
+        return
+    }
     // the workspace overview is up: it holds key focus deliberately,
     // and it floats above layer 0 so the hit-test would tunnel through
     // it and focus the tile underneath — stealing key out from under

@@ -3,8 +3,8 @@
 # uninstalling. `off`: the window manager stops managing (AeroSpace's
 # keybindings go quiet; OmniWM quits — it has no enable toggle), the
 # hover-focus, borders and trackpad-swipe daemons stop, the bar stops.
-# `on` restores all of it, bringing back whichever manager `off` parked
-# (recorded in the marker file). No args = flip.
+# `on` restores all of it, for the window manager this Mac uses (the
+# rule install.sh uses). No args = flip.
 #
 # Untouched either way: Karabiner's CapsLock=Super remap (harmless
 # while AeroSpace is off) and the native menu bar's auto-hide default
@@ -15,12 +15,14 @@ STATE="$HOME/.config/omacosy/disabled"
 UID_N="$(id -u)"
 AGENTS=(com.omacosy.ffm com.omacosy.borders com.omacosy.dwindle com.omacosy.bar com.omacosy.gesture)
 
-# which manager is live right now (off records it into the marker; on
-# can't detect — the manager is down by then — so it reads the marker)
-# a live OmniWM answers its socket in ~3 ms; pgrep -f scanned every
-# process for 31 ms per call, and a stale socket after a crash cannot
-# fool a real request the way a file test could
-wm_is_omniwm() { "$HOME/.local/bin/omacosy-omni" active >/dev/null 2>&1; }
+# the window manager this Mac uses, by the same rule as install.sh. The
+# login item stays while OmniWM is down or restarting, so a manager that
+# does not answer at this moment cannot turn the answer into aerospace.
+wm_is_omniwm() {
+  [ -d /Applications/OmniWM.app ] || return 1
+  "$HOME/.local/bin/omacosy-omni" active >/dev/null 2>&1 \
+    || osascript -e 'tell application "System Events" to exists login item "OmniWM"' 2>/dev/null | grep -qx true
+}
 
 mode="${1:-toggle}"
 if [ "$mode" = toggle ]; then
@@ -32,7 +34,7 @@ case "$mode" in
     if wm_is_omniwm; then
       wm=omniwm
       osascript -e 'quit app "OmniWM"' 2>/dev/null || true
-      pkill -f OmniWM.app 2>/dev/null || true
+      pkill -x OmniWM 2>/dev/null || true
     else
       wm=aerospace
       aerospace enable off 2>/dev/null || true
@@ -44,20 +46,20 @@ case "$mode" in
     echo "omacosy: OFF — vanilla macOS. Restore with: omacosy-toggle on"
     ;;
   on)
-    # empty marker = pre-omniwm install, which was always aerospace
-    wm="$(cat "$STATE" 2>/dev/null || true)"
+    # on brings back what install.sh runs for this manager
+    if wm_is_omniwm; then wm=omniwm; else wm=aerospace; fi
     for a in "${AGENTS[@]}"; do
-      # ffm and swipe fight OmniWM's native focus/swipes — stay parked
-      # under it, same as omacosy-wm-switch keeps them
-      if [ "$wm" = omniwm ]; then
-        case "$a" in com.omacosy.ffm | com.omacosy.gesture) continue ;; esac
-      fi
+      # ffm fights OmniWM's own focus-follows-mouse, so install.sh and
+      # omacosy-wm-switch keep it parked under OmniWM
+      if [ "$wm" = omniwm ] && [ "$a" = com.omacosy.ffm ]; then continue; fi
       launchctl bootstrap "gui/$UID_N" "$HOME/Library/LaunchAgents/$a.plist" 2>/dev/null || true
     done
     if [ "$wm" = omniwm ]; then
       open -a OmniWM 2>/dev/null || true
-    else
+    elif pgrep -x AeroSpace >/dev/null; then
       aerospace enable on 2>/dev/null || true
+    else
+      open -a AeroSpace 2>/dev/null || true
     fi
     rm -f "$STATE"
     echo "omacosy: ON — tiling restored"

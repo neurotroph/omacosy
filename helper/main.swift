@@ -4,7 +4,13 @@
 //   cursor set <x> <y>      warp it there (no synthetic movement, so
 //                           focus-follows-mouse cannot react)
 //   displays                per display (arrangement order): "index<TAB>notched"
+//   default-browser         the default web browser's bundle id; the
+//                           browser chord asks this at press time
+//   default-app <scheme>    the bundle id of the app macOS opens <scheme>
+//                           with (e.g. mailto); bin/omacosy-open asks this
 //   wallpaper <path>        set the desktop picture on every screen
+//   wallpaper resync        put the recorded picture back on any screen
+//                           that shows an older omacosy picture
 //   audio list              output devices: "*<TAB>name" (current) / "-<TAB>name"
 //   audio set <name>        make <name> the default output device
 //   bt power                print bluetooth power state (0/1)
@@ -61,6 +67,28 @@ func fail(_ msg: String) -> Never {
     exit(1)
 }
 
+// --- wallpaper ---------------------------------------------------------
+
+// The folders omacosy takes its pictures from. `wallpaper resync` replaces
+// a screen's picture only when it comes from one of these, so a picture
+// chosen by hand in System Settings is never overwritten.
+func ownedWallpaperRoots() -> [String] {
+    let home = NSHomeDirectory()
+    // The stock themes, found by the rule theme-set itself uses: it lives
+    // in <repo>/bin and they live in <repo>/themes.
+    let repo = URL(fileURLWithPath: home + "/.local/bin/theme-set")
+        .resolvingSymlinksInPath().deletingLastPathComponent().deletingLastPathComponent()
+    let roots = [repo.appendingPathComponent("themes").path]
+    // Each root as written AND resolved, so a folder reached through a
+    // symlink matches either spelling of a picture's path.
+    return Array(Set(roots + roots.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }))
+}
+
+func isOwnedWallpaper(_ url: URL, _ roots: [String]) -> Bool {
+    let paths = [url.path, url.resolvingSymlinksInPath().path]
+    return paths.contains { p in roots.contains { p.hasPrefix($0 + "/") } }
+}
+
 // --- CoreAudio ---------------------------------------------------------
 
 func audioProperty(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
@@ -105,6 +133,19 @@ func deviceName(_ id: AudioDeviceID) -> String {
 
 // --- dispatch ----------------------------------------------------------
 
+// The bundle id of the app macOS opens a URL scheme with, or nil. Asked of
+// LaunchServices on every call so a change in System Settings is followed
+// at once, and so the implicit default (Safari for http on a fresh Mac) is
+// answered too, which reading ~/Library/Preferences com.apple.LaunchServices
+// does not. Shared by `default-browser` and `default-app`.
+func defaultHandler(_ scheme: String) -> String? {
+    guard let probe = URL(string: scheme + ":"),
+          let app = NSWorkspace.shared.urlForApplication(toOpen: probe),
+          let bid = Bundle(url: app)?.bundleIdentifier
+    else { return nil }
+    return bid
+}
+
 let args = CommandLine.arguments
 switch args.count > 1 ? args[1] : "" {
 case "cursor":
@@ -129,8 +170,24 @@ case "displays":
         print("\(i + 1)\t\(notched)")
     }
 
+case "default-browser":
+    // The bundle id of the system's default web browser. bin/omacosy-browser
+    // asks this on every press, so changing the default in System Settings
+    // takes effect at the next Super+Shift+Return with no reinstall.
+    guard let bid = defaultHandler("http") else { exit(1) }
+    print(bid)
+
+case "default-app":
+    // The bundle id of the app macOS opens <scheme> with. bin/omacosy-open
+    // asks it for mailto (and anything else), the general form of
+    // `default-browser`.
+    guard args.count > 2, let bid = defaultHandler(args[2]) else { exit(1) }
+    print(bid)
+
 case "wallpaper":
-    guard args.count > 2 else { fail("usage: wallpaper <path> | wallpaper get") }
+    guard args.count > 2 else {
+        fail("usage: wallpaper <path> | wallpaper get | wallpaper resync")
+    }
     // `get` prints each screen's current wallpaper path in arrangement
     // order — install.sh records these so uninstall.sh can put the
     // pre-omacosy picture back instead of leaving the theme wallpaper
@@ -140,6 +197,40 @@ case "wallpaper":
             print(NSWorkspace.shared.desktopImageURL(for: screen)?.path ?? "")
         }
         break
+    }
+    // `resync` puts the recorded picture back on every screen that shows
+    // an older omacosy picture.
+    //
+    // Setting it below only reaches screens CONNECTED AT THE TIME, and
+    // macOS remembers the desktop picture per display. So a display that
+    // was unplugged during a theme change keeps its old picture and brings
+    // it back on reconnect: one screen showing the previous theme, with no
+    // error anywhere.
+    //
+    // theme-set and theme-bg-next both record their choice in the state
+    // link, so the answer is already on disk and no argument is needed.
+    if args[2] == "resync" {
+        let link = NSHomeDirectory() + "/.local/state/omacosy/background"
+        let url = URL(fileURLWithPath: link).resolvingSymlinksInPath()
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            fail("wallpaper resync: nothing recorded at \(link)")
+        }
+        let roots = ownedWallpaperRoots()
+        var failures = 0, changed = 0, kept = 0
+        for screen in NSScreen.screens {
+            // Skip a screen that already has it. Re-setting the picture
+            // macOS is already showing costs a visible redraw.
+            guard let now = NSWorkspace.shared.desktopImageURL(for: screen),
+                  now.resolvingSymlinksInPath().path != url.path else { continue }
+            guard isOwnedWallpaper(now, roots) else { kept += 1; continue }
+            do {
+                try NSWorkspace.shared.setDesktopImageURL(url, for: screen, options: [:])
+                changed += 1
+            } catch { failures += 1 }
+        }
+        print("wallpaper resync: \(changed) of \(NSScreen.screens.count) screen(s) reset to \(url.path)"
+              + (kept > 0 ? ", \(kept) kept (not an omacosy picture)" : ""))
+        exit(failures == 0 ? 0 : 1)
     }
     let url = URL(fileURLWithPath: args[2])
     var failures = 0
@@ -310,12 +401,20 @@ case "split-hint":
     // the focus change — faster than any app can open its next window.
     //
     // Refocusing an EXISTING window (hover, keyboard) reads the frame
-    // directly: it already sits in its slot, no waiting needed. The
-    // slow settle-wait survives only as the fallback when there is no
-    // fresh state to chain from (first window in a burst).
-    // State is one line: "wid w h ts". A 3s TTL bounds how stale a
-    // chain can get (manual resizes, closes, and workspace switches
-    // invalidate predictions; a burst of opens never lives that long).
+    // directly: it usually already sits in its slot, so the hint lands
+    // at once, and is then checked (see the end of this case) for the
+    // refocus that follows a window leaving. The slow settle-wait
+    // survives as the fallback when there is no fresh state to chain
+    // from (first window in a burst).
+    // State is one line: "wid w h ts verified maxWid ws". A 3s TTL bounds
+    // how stale a chain can get (manual resizes, closes, and workspace
+    // switches invalidate predictions; a burst of opens never lives that
+    // long). The first five fields are the ones older helpers read.
+    // `maxWid` is the highest id ever hinted: ids only increase, so an id
+    // above it is a new window, while `wid > s.wid` alone also passes an
+    // older window with a higher id. `ws` is the workspace the slot was
+    // measured on: a lone window on an empty workspace must not chain off
+    // a slot measured on the workspace just left.
     func frame() -> (CGFloat, CGFloat, CGFloat, CGFloat)? {
         guard let list = CGWindowListCopyWindowInfo(.optionIncludingWindow, wid) as? [[String: Any]],
             let b = list.first?[kCGWindowBounds as String] as? [String: CGFloat],
@@ -323,41 +422,13 @@ case "split-hint":
             let w = b["Width"], let h = b["Height"] else { return nil }
         return (x, y, w, h)
     }
-    let splitWidthMultiplier: CGFloat = 1.4
-    // ~/.local/state (mode 700), not /tmp: a world-writable directory
-    // lets any other local uid plant a symlink at a predictable name
-    // and redirect these writes.
-    let runDir = "\(NSHomeDirectory())/.local/state/omacosy/run"
-    try? FileManager.default.createDirectory(
-        atPath: runDir, withIntermediateDirectories: true,
-        attributes: [.posixPermissions: 0o700])
-    let statePath = "\(runDir)/split-state"
-    let now = Date().timeIntervalSince1970
-    var state: (wid: UInt32, w: CGFloat, h: CGFloat)?
-    if let line = try? String(contentsOfFile: statePath, encoding: .utf8) {
-        let f = line.split(separator: " ").compactMap { Double($0) }
-        if f.count == 4, now - f[3] < 3 { state = (UInt32(f[0]), CGFloat(f[1]), CGFloat(f[2])) }
-    }
-    var w: CGFloat
-    var h: CGFloat
-    var how: String
-    if let s = state, wid > s.wid {
-        // fresh spawn inside a burst: its slot is the half left over
-        // from the split we just issued on the previous window
-        if s.w >= s.h * splitWidthMultiplier { w = s.w / 2; h = s.h } else { w = s.w; h = s.h / 2 }
-        how = "predicted"
-    } else if state != nil, let f = frame() {
-        // an existing window refocused mid-burst: its frame is settled
-        (w, h) = (f.2, f.3)
-        how = "read"
-    } else {
-        // no fresh chain to ride: wait for the frame to stop moving.
-        // "Two equal samples" alone is not enough — an untiled window's
-        // frame equals itself — so a new window must MOVE (get tiled)
-        // before its frame is trusted, while a hover-focused window that
-        // never moves is accepted after a short grace. Full bounds, not
-        // just size: a spawning terminal inherits the last window's
-        // size, so only the position reliably changes on tile.
+    // Wait for the frame to stop moving. "Two equal samples" alone is not
+    // enough — an untiled window's frame equals itself — so a window must
+    // MOVE before its frame counts as settled, while one that never moves
+    // is accepted after a short grace. Full bounds, not just size: a
+    // spawning terminal inherits the last window's size, so only the
+    // position reliably changes on tile.
+    func settle() -> (frame: (CGFloat, CGFloat, CGFloat, CGFloat)?, moved: Bool) {
         var sample = frame()
         var moved = false
         for tick in 1...16 {
@@ -368,9 +439,7 @@ case "split-hint":
             sample = next
             if !moved && tick >= 5 { break }
         }
-        guard let f = sample else { exit(0) }
-        (w, h) = (f.2, f.3)
-        how = moved ? "settled" : "static"
+        return (sample, moved)
     }
     // Direction: Hyprland's rule is `stack when h * multiplier > w`
     // (dwindle:split_width_multiplier, default 1.0). At 1.0 an
@@ -379,23 +448,160 @@ case "split-hint":
     // makes that half-slot stack first, which restores the 16:9
     // left/down/left cadence on a 3440-wide display without changing
     // behavior on displays where the half is already taller than wide.
-    let dir = w >= h * splitWidthMultiplier ? "horizontal" : "vertical"
+    let splitWidthMultiplier: CGFloat = 1.4
+    func direction(_ w: CGFloat, _ h: CGFloat) -> String {
+        w >= h * splitWidthMultiplier ? "horizontal" : "vertical"
+    }
     let aerospaceBin = ["/opt/homebrew/bin/aerospace", "/usr/local/bin/aerospace"]
         .first { FileManager.default.isExecutableFile(atPath: $0) } ?? "aerospace"
-    let split = Process()
-    split.executableURL = URL(fileURLWithPath: aerospaceBin)
-    split.arguments = ["split", "--window-id", idStr, dir]
-    split.standardError = FileHandle.nullDevice
-    try? split.run()
-    split.waitUntilExit()
-    try? "\(wid) \(w) \(h) \(now)".write(toFile: statePath, atomically: true, encoding: .utf8)
-    if let d = "\(Date().timeIntervalSince1970) wid=\(idStr) \(Int(w))x\(Int(h)) (\(how)) -> \(dir == "horizontal" ? "h" : "v") rc=\(split.terminationStatus)\n".data(using: .utf8),
-        let fh = FileHandle(forWritingAtPath: "\(runDir)/split-hint.log") ?? {
-            FileManager.default.createFile(atPath: "\(runDir)/split-hint.log", contents: nil)
-            return FileHandle(forWritingAtPath: "\(runDir)/split-hint.log")
-        }() {
+    func split(_ dir: String) -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: aerospaceBin)
+        p.arguments = ["split", "--window-id", idStr, dir]
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+        p.waitUntilExit()
+        return p.terminationStatus
+    }
+    // ~/.local/state (mode 700), not /tmp: a world-writable directory
+    // lets any other local uid plant a symlink at a predictable name
+    // and redirect these writes.
+    let runDir = "\(NSHomeDirectory())/.local/state/omacosy/run"
+    try? FileManager.default.createDirectory(
+        atPath: runDir, withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700])
+    let logPath = "\(runDir)/split-hint.log"
+    func note(_ w: CGFloat, _ h: CGFloat, _ how: String, _ dir: String, _ rc: Int32?) {
+        guard let d = "\(Date().timeIntervalSince1970) wid=\(idStr) \(Int(w))x\(Int(h)) (\(how)) -> \(dir == "horizontal" ? "h" : "v") rc=\(rc.map(String.init) ?? "-")\n".data(using: .utf8),
+            let fh = FileHandle(forWritingAtPath: logPath) ?? {
+                FileManager.default.createFile(atPath: logPath, contents: nil)
+                return FileHandle(forWritingAtPath: logPath)
+            }() else { return }
         fh.seekToEndOfFile(); fh.write(d); fh.closeFile()
     }
+    let statePath = "\(runDir)/split-state"
+    let now = Date().timeIntervalSince1970
+    // the focused workspace, as aerospace.toml's workspace-change hook
+    // writes it for the bar: a file read, so no subprocess on this path.
+    // "" when unknown, and an unknown side never refuses a chain.
+    let currentWs = ((try? String(contentsOfFile: "\(runDir)/bar-ws", encoding: .utf8)) ?? "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    var state: (wid: UInt32, w: CGFloat, h: CGFloat, verified: Bool, ws: String)?
+    var maxWid: UInt32 = 0
+    if let line = try? String(contentsOfFile: statePath, encoding: .utf8) {
+        let parts = line.split(separator: " ").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        // Numbers come from a fixed prefix, because the workspace name may
+        // be a number too. "wid w h ts" (four fields) counts as verified;
+        // "wid w h ts verified" is the five-field line; seven adds maxWid
+        // and ws. An eight-field "wid w h ts maxWid count verified ws" line
+        // is from an earlier build of this branch and is read as such.
+        let n = parts.count >= 8 ? 7 : min(parts.count, 6)
+        let f = parts.prefix(n).compactMap { Double($0) }
+        let ids = 0...Double(UInt32.max)
+        if f.count == n, n >= 4, ids.contains(f[0]) {
+            let old8 = parts.count >= 8
+            let verified = n < 5 || (old8 ? f[6] != 0 : f[4] != 0)
+            let mw = old8 ? f[4] : (n >= 6 ? f[5] : 0)
+            if ids.contains(mw) { maxWid = UInt32(mw) }
+            let ws = old8 ? parts[7] : (parts.count >= 7 ? parts[6] : "")
+            // maxWid is kept past the TTL on purpose: an expired line still
+            // proves its ids were seen
+            if now - f[3] < 3 {
+                state = (UInt32(f[0]), CGFloat(f[1]), CGFloat(f[2]), verified, ws == "-" ? "" : ws)
+            }
+        }
+    }
+    // No state (a first window, or the runtime dir cleared by a restart): seed maxWid
+    // from every window macOS lists, so an old window with a high id is not
+    // taken for new by the NEXT run. In-process, and only on the path that
+    // is about to spend ~400ms settling anyway.
+    if state == nil,
+        let all = CGWindowListCopyWindowInfo(.optionAll, kCGNullWindowID) as? [[String: Any]] {
+        let top = all.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value }.max() ?? 0
+        maxWid = max(maxWid, top)
+    }
+    var w: CGFloat
+    var h: CGFloat
+    var how: String
+    if let s = state, s.verified, wid > s.wid, wid > maxWid,
+        s.ws.isEmpty || currentWs.isEmpty || s.ws == currentWs {
+        // fresh spawn inside a burst: its slot is the half left over
+        // from the split we just issued on the previous window. Only a
+        // VERIFIED slot may be halved: chaining off a read that has not
+        // been checked yet is how a close poisoned the whole burst.
+        if s.w >= s.h * splitWidthMultiplier { w = s.w / 2; h = s.h } else { w = s.w; h = s.h / 2 }
+        how = "predicted"
+    } else if state != nil, wid <= max(maxWid, state!.wid), let f = frame() {
+        // an existing window refocused mid-burst: usually settled, and
+        // checked below for when it is not
+        (w, h) = (f.2, f.3)
+        how = "read"
+    } else {
+        // no fresh chain to ride: wait for the frame to stop moving
+        let settled = settle()
+        guard let f = settled.frame else { exit(0) }
+        (w, h) = (f.2, f.3)
+        how = settled.moved ? "settled" : "static"
+    }
+    func stampLine(_ w: CGFloat, _ h: CGFloat, _ ts: Double, _ verified: Bool) -> String {
+        "\(wid) \(w) \(h) \(ts) \(verified ? 1 : 0) \(max(wid, maxWid)) \(currentWs.isEmpty ? "-" : currentWs)"
+    }
+    let dir = direction(w, h)
+    let rc = split(dir)
+    // A read is published PROVISIONAL. The single wrong split was never the
+    // worst of issue #17: the stale slot went into the chain, and the next
+    // window halved it. Until the watch below confirms the slot, a window
+    // opening inside the grace takes the settle path instead of chaining.
+    let stamp = stampLine(w, h, now, how != "read")
+    try? stamp.write(toFile: statePath, atomically: true, encoding: .utf8)
+    note(w, h, how, dir, rc)
+
+    // A read trusts the frame to be settled, and a refocus by hover or
+    // keyboard is exactly that. A refocus caused by a window LEAVING is
+    // not (issue #17): close the second window and the survivor takes
+    // focus while AeroSpace has yet to re-expand it, so the read catches
+    // its old half-size slot. No liveness test tells the two apart — the
+    // window server still lists a just-closed window, and a window moved
+    // or hidden away is alive anyway. So the read keeps its speed and is
+    // then watched until its frame holds still — the settle grace of
+    // ~375ms when nothing moves, up to ~1.2s once something does. If the
+    // frame changed, the settled frame decides: the slot is published,
+    // because the NEXT window's prediction halves it, and a direction
+    // that flipped is issued again.
+    //
+    // Issuing it again is invisible: the split above left this window as
+    // its container's only child, and `split` on an only child just turns
+    // that container. That holds only while no window has joined it, so
+    // any newer hint in the state file cancels the correction — a second
+    // split would nest the newcomer.
+    guard how == "read" else { exit(0) }
+    let watched = settle().frame
+    // Still ours? A newer line means another hint owns the chain now.
+    guard (try? String(contentsOfFile: statePath, encoding: .utf8)) == stamp,
+        let f = watched else { exit(0) }
+    // 2pt of slack: a frame that jitters by a pixel has not moved.
+    let tol: CGFloat = 2
+    let grew = f.2 > w + tol || f.3 > h + tol
+    let shrank = f.2 < w - tol || f.3 < h - tol
+    guard grew || shrank else {
+        // settled where it was read: the same slot, now verified
+        try? stampLine(w, h, Date().timeIntervalSince1970, true)
+            .write(toFile: statePath, atomically: true, encoding: .utf8)
+        exit(0)
+    }
+    let fixed = direction(f.2, f.3)
+    // Only a slot that GREW may be split again. A survivor re-expanding
+    // after a close grows; a window JOINING this container shrinks it, and
+    // a join is not always announced — `omacosy-layout togglesplit` retiles
+    // in place, and a window can open without taking focus, so neither
+    // writes a hint the guard above could see. Splitting then would nest
+    // the newcomer. The slot is still published either way: the next
+    // window's prediction halves it, so a changed size matters even when
+    // nothing is re-split.
+    let rcFixed: Int32? = (grew && !shrank && fixed != dir) ? split(fixed) : nil
+    try? stampLine(f.2, f.3, Date().timeIntervalSince1970, true)
+        .write(toFile: statePath, atomically: true, encoding: .utf8)
+    note(f.2, f.3, shrank ? "re-read, shrank" : "re-read", fixed, rcFixed)
 
 case "audio":
     let sub = args.count > 2 ? args[2] : "list"
@@ -474,5 +680,5 @@ case "bt":
     }
 
 default:
-    fail("usage: omacosy-helper cursor | displays | wallpaper <path> | audio ... | bt ... | brightness [set <0-100>] | input-age")
+    fail("usage: omacosy-helper cursor | displays | default-browser | default-app <scheme> | wallpaper <path> | audio ... | bt ... | brightness [set <0-100>] | input-age")
 }

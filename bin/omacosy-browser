@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# omacosy-browser — Super+Shift+Return opens the browser.
+#
+# By default that is whatever macOS has as its default web browser, asked
+# from LaunchServices at press time: changing the default in System Settings
+# takes effect on the next press, with no reinstall. Set BROWSER in
+# ~/.config/omacosy/settings.conf (applied to ~/.config/omacosy/apps.conf)
+# to pin one app instead.
+set -u
+
+APPS="$HOME/.config/omacosy/apps.conf"
+HELPER="$HOME/.local/bin/omacosy-helper"
+
+BROWSER=""
+[ -f "$APPS" ] && . "$APPS" 2>/dev/null
+
+# A pinned app comes first, and falls through if it is no longer installed.
+if [ -n "$BROWSER" ] && open -a "$BROWSER" 2>/dev/null; then
+  exit 0
+fi
+
+# The system default, by bundle id (open -b needs no name resolved). Asked
+# each press, so a changed default is followed without touching a config.
+if [ -x "$HELPER" ]; then
+  BID="$("$HELPER" default-browser 2>/dev/null || true)"
+  if [ -n "$BID" ] && open -b "$BID" 2>/dev/null; then
+    exit 0
+  fi
+fi
+
+# Last resort, so the chord still opens something on a Mac with no helper.
+open -a Safari 2>/dev/null || true

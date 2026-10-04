@@ -26,10 +26,23 @@ details are under [What's inside](#whats-inside).
 
 ## Fresh Mac
 
+The same command installs and reinstalls. It clones the repo, or updates
+the clone that is already there, then runs the installer:
+
 ```sh
-git clone https://github.com/paulsp94/omacosy.git ~/.local/share/omacosy &&
-cd ~/.local/share/omacosy && ./install.sh
+d=~/.local/share/omacosy
+if [ -d "$d/.git" ]; then git -C "$d" pull --ff-only; else git clone https://github.com/paulsp94/omacosy.git "$d"; fi &&
+cd "$d" && ./install.sh
 ```
+
+This installs AeroSpace. For [OmniWM](#two-window-managers-omniwm-option-beta)
+instead, run `./install.sh --omniwm`: AeroSpace is then not installed.
+A later `install.sh` or `omacosy-update` keeps the window manager you
+chose.
+
+`./install.sh --yazi` also installs yazi, an optional file manager on
+`Super+Shift+Y`; `--yazi-full` adds its video and raw-photo previews. Both
+are off by default; see [the tool table](#whats-inside).
 
 The clone location matters. Configs are symlinked into the repo, and
 macOS privacy (TCC) blocks launchd services from reading `~/Documents`,
@@ -75,10 +88,10 @@ grant hide themselves rather than half-work.
 |---|---|---|---|
 | **Accessibility** | AeroSpace *or* OmniWM, `omacosy-gesture`, `omacosy-bar` (reads the focused app's menus for the app-pill popup), `omacosy-ffm` (AeroSpace mode only) | Move, resize and focus other apps' windows. This is the tiling itself, and it is the broadest permission here. | Nothing tiles. Not optional in practice. |
 | **Input Monitoring** | Karabiner-Elements, `omacosy-gesture` (and OmniWM, under that option) | Karabiner reads keys to remap Caps Lock; `omacosy-gesture` reads raw trackpad contacts, because macOS 26 stopped carrying touch data in normal events. | No Super key, no swipe gestures. |
-| **Screen Recording** | `omacosy-overview` | Captures a thumbnail per window for the overview cards, including windows the window manager has stashed offscreen. A screenshot of the visible screen could not see those. | Cards fall back to app icons and titles. |
+| **Screen Recording** | the program that first starts `omacosy-overview` ([see below](#permissions)) | Captures a thumbnail per window for the overview cards, including windows the window manager has stashed offscreen. A screenshot of the visible screen could not see those. | Cards fall back to app icons and titles. |
 | **Bluetooth** | `omacosy-bar` | Reads adapter power and the paired-device list for the bluetooth pill and its menu. | The pill hides itself. |
 | **Location** | `omacosy-bar` | Reads **only** the wi-fi network's name, which macOS classes as location data. No coordinate is ever requested; the authorisation itself is what unlocks `CWInterface.ssid()`. | The wi-fi popup's title row reads "wi-fi" instead of your network's name. Everything else is unaffected. |
-| **Automation** | `omacosy-bar`, `theme-set` | Apple Events to **Spotify** (what is playing; play/pause/next from the media pill) and to **System Events** (sleep, lock and restart from the Apple menu; setting the wallpaper). | The media pill hides; those menu rows do nothing. |
+| **Automation** | `omacosy-bar`, `theme-set`, `omacosy-finder-window` | Apple Events to **Spotify** (what is playing; play/pause/next from the media pill), to **System Events** (sleep, lock and restart from the Apple menu; setting the wallpaper) and to **Finder** (a new window for `Super+Shift+F`). | The media pill hides; those menu rows do nothing; `Super+Shift+F` opens no window. |
 | **Files and Folders** | `omacosy-bar` | Only if your clone lives in `~/Documents`, `~/Desktop` or `~/Downloads`. The bar reads its palette from the theme directory inside the repo, and macOS walls launchd agents off from those folders. | The bar **hangs at startup** waiting on the prompt. Clone to `~/.local/share/omacosy` and this never comes up. |
 
 More on **Location**, because it sounds worse than it is: it buys
@@ -88,6 +101,18 @@ no location updates. Two things are required and neither alone is
 enough: measured on macOS 26.3, an unbundled binary reads `nil` however
 it is authorised, which is why the bar ships inside a minimal `.app`.
 Refuse the grant and you lose the name, nothing else.
+
+More on **Screen Recording**, because the entry that counts is not the
+one you would expect. `omacosy-overview` takes the thumbnails, but it keeps
+running in the background after it first opens, and macOS holds the program
+that started it that first time responsible for every later opening too.
+Observed in macOS's permission log on macOS 27.2, with the overview started
+fresh each time: `omacosy-gesture` when a four-finger swipe up started it,
+Karabiner-Elements (`Karabiner-Console-User-Server`) when Super+O started it
+under OmniWM, and the overview's own entry not consulted. Those are the
+entries to switch on. An overview first started from a terminal answers to
+that terminal's entry until it stops. Under AeroSpace, Super+O does
+something else, and the swipe is the only way in.
 
 ### What it does not do
 
@@ -118,22 +143,49 @@ Refuse the grant and you lose the name, nothing else.
   they carry window titles, app names and workspace numbers, never
   input.
 
-Grants are tied to a binary's code signature. With an Apple Development
-identity present, `install.sh` signs every helper with a stable
-identifier so rebuilds keep their grants; without one, macOS treats
-each rebuild as a new app and you re-grant after every install.
+### Keep your permissions across updates
+
+macOS keeps each permission with the program's code signature. With an
+Apple Development certificate on this Mac, `install.sh` signs every
+helper with it, and an update keeps all your permissions. Without one,
+macOS treats each rebuilt helper as a new app, and you grant its
+permissions again after an update. omacosy works either way, and
+`install.sh` ends with a warning while no certificate signs.
+
+To add a certificate (free, needs an Apple ID):
+
+1. Install Xcode from the App Store and open it once.
+2. Xcode → Settings → Accounts: add your Apple ID.
+3. Select it, then **Manage Certificates → + → Apple Development**.
+4. Run `./install.sh` again, or `omacosy-update`.
+
+You can do this before or after installing omacosy. The next install
+signs with the certificate. macOS then asks once more for each
+permission, because the signature changed; after that, no update asks
+again.
+
+If `install.sh` says the certificate cannot sign because Apple's G3
+certificate is missing, answer `y` when it offers to add it, or add it
+yourself:
+
+```sh
+cd /tmp && curl -fsSLO https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
+security add-certificates -k ~/Library/Keychains/login.keychain-db AppleWWDRCAG3.cer
+```
 
 ## App choices
 
 Keybindings launch apps defined in `config/apps.conf`. Defaults are
-Ghostty, Safari, Spotify, Slack (terminal, browser, music, messenger).
-Override any of them in `config/apps.local.conf` (gitignored), then
-re-run `install.sh`:
+Ghostty, Spotify, Slack (terminal, music, messenger). The browser and
+mail chords have no app of their own: they open the macOS **default** web
+browser and mail app, asked at each press, so changing the default in
+System Settings takes effect with no reinstall. Override any app in
+`config/apps.local.conf` (gitignored), then re-run `install.sh`:
 
 ```sh
 # config/apps.local.conf — your picks win over apps.conf
 TERMINAL=Korren
-BROWSER=Arc
+BROWSER=Arc          # pins the browser chord; EMAIL pins the mail chord
 ```
 
 Your personal shell config belongs in `~/.zshrc.local`; the repo's
@@ -158,6 +210,7 @@ Your personal shell config belongs in `~/.zshrc.local`; the repo's
 | Prompt | starship | `config/starship.toml` |
 | Shell | zsh | `zsh/zshrc` + your `~/.zshrc.local` |
 | CLI stack | fzf, eza, zoxide, ripgrep, bat, lazygit, btop | wired in `zsh/zshrc` |
+| Files, opt-in | yazi on `Super+shift+y`, in a Ghostty window. `./install.sh --yazi` installs it with `fd`, `poppler`, `resvg` and `sevenzip` for search and previews; `--yazi-full` adds `ffmpeg-full` and `imagemagick-full` for video thumbnails and raw photos (large). Without either flag nothing is installed and the key stays unbound | `bin/omacosy-files` |
 
 Why so much of it is self-built:
 
@@ -317,10 +370,11 @@ typing or app shortcuts. Caps Lock tapped alone is Escape.
 | `Super+r` | resize mode (`h/j/k/l`, `-`/`=`, `esc`) — AeroSpace only; OmniWM has no binding modes |
 | `Super+shift+;` | service mode (`esc` reload, `r` flatten, `⌫` close others) |
 | **Apps and system** | |
-| `Super+enter` / `Super+shift+enter` | terminal / browser |
+| `Super+enter` / `Super+shift+enter` | terminal / browser (the default browser) |
 | `Super+space` | launcher (Raycast; the OmniWM option opens OmniWM's command palette instead) |
-| `Super+shift+f` / `+m` / `+g` | files / music / messenger (set in `apps.conf`) |
+| `Super+shift+f` / `+m` / `+g` / `+e` | files / music / messenger / mail (set in `apps.conf`; mail is the default mail app); files opens a NEW Finder window on every press |
 | `Super+shift+t` | next theme |
+| `Super+shift+y` | yazi, a file manager, in a new Ghostty window (only when yazi is installed) |
 | `Super+shift+b` | next wallpaper of the current theme |
 | `Super+shift+l` | lock the screen |
 | `Super+k` | keybinding cheatsheet (this table, rendered from the config) |
@@ -330,6 +384,15 @@ typing or app shortcuts. Caps Lock tapped alone is Escape.
 Screenshots, clipboard and app switching stay macOS's own
 (`Cmd+Shift+3/4/5`, `Cmd+C/V`, `Cmd+Tab`). `Alt+Tab` above is the
 *window*-scoped switcher macOS lacks.
+
+**The files key gives a new window every time.** `open ~` makes a window
+only when no Finder window shows your home folder. After that it raises
+the one you have, so the key stops making new ones.
+`omacosy-finder-window` asks Finder for a *window* instead, which costs the Automation permission for Finder on first use. It
+spawns through `omacosy-spawn --cmd <command...>`, the same lock
+`Super+Enter` takes, so a burst of presses still splits one slot at a time
+instead of landing in one flat row. Finder will not draw a window below 474
+points wide, which is Finder's own floor and not a tiling fault.
 
 **On the modifier space.** omarchy layers `Super+Ctrl` and `Super+Alt`
 on top of `Super`. This setup cannot: Super IS `cmd+ctrl+alt`, so those
@@ -412,6 +475,16 @@ and another window may grab focus before the hint lands. One hook
 covers both hover and keyboard focus: AeroSpace notices the focus
 `omacosy-ffm` moves, even though ffm moves it through SkyLight.
 
+A refocus is the one case that does not wait: an existing window
+usually sits in its slot already, so its frame is read at once. It is
+then watched for a moment anyway, because a refocus can also follow a
+window leaving. Close the second of two windows and the survivor takes
+focus before AeroSpace has re-expanded it, so the read catches its old
+half slot. If the frame changes, the settled frame decides and the hint
+is issued again, which nobody sees: the window is its container's only
+child at that point, and `split` on an only child just turns the
+container.
+
 Manual control (Super+J flips, resize, float) works unchanged.
 
 Floats get a rescue path, because macOS will not keep them on top:
@@ -430,13 +503,15 @@ layout — omacosy can run on either, and switching is one command:
 ```sh
 omacosy-wm-switch omniwm      # installs OmniWM on first use, then
                               # switches with a guarded handover
-omacosy-wm-switch aerospace   # the way back
+omacosy-wm-switch aerospace   # the way back, and installs AeroSpace
+                              # on first use after ./install.sh --omniwm
 ```
 
-The switch is deliberately paranoid: it snapshots your windows, waits
-for you to grant OmniWM's permissions, and requires you to confirm
-within 90 seconds that workspace switching works — anything else
-reverts to AeroSpace automatically and puts your windows back.
+The switch checks itself: it snapshots your windows, stops AeroSpace,
+starts OmniWM and waits until OmniWM manages them. On a first switch,
+grant OmniWM's permissions when macOS asks. If OmniWM does not take
+over within 2 minutes, or you press Ctrl-C, the switch reverts to
+AeroSpace and puts your windows back.
 
 Under OmniWM everything keeps working — bar, overview (with
 type-to-search), gestures, keybindings, themes — and the dwindle
@@ -545,8 +620,11 @@ copy of anything.
 ## Back to a normal Mac
 
 ```sh
-./uninstall.sh
+~/.local/share/omacosy/uninstall.sh
 ```
+
+If you cloned omacosy somewhere else, run `<your clone>/uninstall.sh`.
+The script finds the clone from its own path.
 
 Manifest-driven: `install.sh` records what this machine actually gained
 (Homebrew packages that weren't already present, cloned repos, every
@@ -554,6 +632,35 @@ Manifest-driven: `install.sh` records what this machine actually gained
 exactly that. Tools and settings you had before omacosy are never
 touched. Pre-manifest installs fall back to a conservative teardown
 that leaves all Homebrew packages in place.
+
+Before it removes anything, the script saves your omacosy settings, the
+record of this install and your `karabiner.json` in
+`~/omacosy-backup-<date>-<time>/`. It prints that folder's path at the end.
+
+After the script, do these steps in this order:
+
+1. Close the terminal window and open a new one. The old window still
+   uses omacosy's shell setup, and some of the programs it calls are gone.
+2. Optional: delete the clone. The script keeps it, and nothing breaks
+   if it stays. With the clone kept, a reinstall is one command. To
+   delete it, run `rm -rf <your clone>`. The default clone is
+   `~/.local/share/omacosy`.
+3. If omacosy installed Homebrew, the script says so. To remove Homebrew
+   too, use Homebrew's own uninstall script. Homebrew packages you had
+   before omacosy stay installed.
+4. In System Settings → General → Login Items, remove AeroSpace if it is
+   still in the list.
+5. If you used the Caps Lock dictation shortcut in the Claude desktop app,
+   turn it on again in Claude's settings. The install removed it.
+6. Optional: in System Settings → Privacy & Security, delete the entries
+   omacosy added. The [permissions table](#permissions) lists each one
+   and the program it names. No script can remove them, and they do
+   nothing once the programs are gone.
+7. Log out and log in again. The native menu bar comes back fully only
+   then.
+
+To stop omacosy for a while without removing it, see
+[Parking the setup](#parking-the-setup).
 
 ## License & credits
 

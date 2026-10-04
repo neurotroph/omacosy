@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# omacosy-open — open a URL, a file, or the default app for a scheme.
+#
+#   omacosy-open https://example.com   the address, in the default browser
+#   omacosy-open mailto:you@example.com  a new message, in the default mail app
+#   omacosy-open mailto                the default mail app itself
+#   omacosy-open ~/Desktop/notes.md    the file, in whatever opens .md
+#
+# The system default is resolved from LaunchServices at each call, so a
+# change in System Settings is followed with no reinstall. Set BROWSER or
+# EMAIL in ~/.config/omacosy/settings.conf to pin that scheme to one app
+# instead. A chord that runs this must name it by absolute path:
+# $HOME/.local/bin/omacosy-open.
+set -u
+
+APPS="$HOME/.config/omacosy/apps.conf"
+HELPER="$HOME/.local/bin/omacosy-helper"
+
+BROWSER="" EMAIL=""
+[ -f "$APPS" ] && . "$APPS" 2>/dev/null
+
+[ "$#" -ge 1 ] || { echo "usage: omacosy-open <url|file|scheme>..." >&2; exit 2; }
+
+# the pinned app for a scheme, if any
+override_for() {
+  case "$1" in
+    http | https) printf '%s' "$BROWSER" ;;
+    mailto)       printf '%s' "$EMAIL" ;;
+  esac
+}
+
+# launch the app that handles a scheme, with no URL attached
+open_app_for() {            # <scheme>
+  local scheme=$1 ov bid
+  ov="$(override_for "$scheme")"
+  if [ -n "$ov" ] && open -a "$ov" 2>/dev/null; then return 0; fi
+  if [ -x "$HELPER" ]; then
+    bid="$("$HELPER" default-app "$scheme" 2>/dev/null || true)"
+    if [ -n "$bid" ] && open -b "$bid" 2>/dev/null; then return 0; fi
+  fi
+  return 1
+}
+
+for target in "$@"; do
+  case "$target" in
+    # a full URL: open it, through the pinned app when one is set
+    *://* | mailto:*)
+      scheme="${target%%:*}"
+      ov="$(override_for "$scheme")"
+      if [ -n "$ov" ] && open -a "$ov" "$target" 2>/dev/null; then continue; fi
+      open "$target" 2>/dev/null || true ;;
+    # a bare scheme name: the app itself, not a URL
+    http | https | mailto)
+      open_app_for "$target" || open "$target" 2>/dev/null || true ;;
+    # anything else is a file or an app's own argument
+    *)
+      open "$target" 2>/dev/null || true ;;
+  esac
+done

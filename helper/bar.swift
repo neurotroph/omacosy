@@ -115,9 +115,9 @@ let runDir: String = {
 let logURL = URL(fileURLWithPath: "\(runDir)/bar.log")
 
 // The OTHER window manager. omacosy-wm-switch can hand the session from
-// AeroSpace to OmniWM (and back) while this daemon runs, so which one is
-// asked is decided per use, never cached: the running-app check is an
-// in-process lookup, cheap enough to be the whole detection.
+// AeroSpace to OmniWM (and back) while this daemon runs. The running-app
+// check is an in-process lookup, cheap enough to be the whole detection;
+// reconcile() below keeps which manager labels the bar in labelsFromOmniWM.
 let omniwmBundleID = "com.barut.OmniWM"
 
 func omniwmActive() -> Bool {
@@ -527,7 +527,11 @@ func apply(_ s: Snapshot) -> Bool {
     }
     if model.occupied != s.occupied { model.occupied = s.occupied; changed = true }
     if model.soleApp != s.soleApp { model.soleApp = s.soleApp; changed = true }
-    if !s.focused.isEmpty, model.focused != s.focused { model.focused = s.focused; changed = true }
+    if !s.focused.isEmpty, model.focused != s.focused {
+        tlog("focused \(s.focused) (snapshot)")
+        model.focused = s.focused
+        changed = true
+    }
     return changed
 }
 
@@ -609,7 +613,9 @@ func spotify(_ command: String) {
 struct BarItem: Equatable {
     var icon = ""
     var label = ""
-    var iconColor: NSColor?
+    // which palette colour, not a copy of it: read when drawing, so a
+    // theme switch recolours every pill in the repaint it already does
+    var iconColor: KeyPath<Palette, NSColor>?
     var drawing = true
 }
 
@@ -662,15 +668,15 @@ func updateBattery() {
         let pct = max > 0 ? Int((Double(cur) / Double(max) * 100).rounded()) : cur
         let charging = (d[kIOPSPowerSourceStateKey] as? String) == kIOPSACPowerValue
         // same thresholds and glyphs the bar already uses
-        var icon = "󰂃", color = palette.red
+        var icon = "󰂃", color: KeyPath<Palette, NSColor> = \.red
         switch pct {
-        case 90...: icon = "󰁹"; color = palette.green
-        case 60..<90: icon = "󰂀"; color = palette.label
-        case 30..<60: icon = "󰁾"; color = palette.label
-        case 10..<30: icon = "󰁻"; color = palette.yellow
+        case 90...: icon = "󰁹"; color = \.green
+        case 60..<90: icon = "󰂀"; color = \.label
+        case 30..<60: icon = "󰁾"; color = \.label
+        case 10..<30: icon = "󰁻"; color = \.yellow
         default: break
         }
-        if charging { icon = "󰂄"; color = palette.green }
+        if charging { icon = "󰂄"; color = \.green }
         set("battery") { $0.icon = icon; $0.iconColor = color; $0.label = "\(pct)%" }
         return
     }
@@ -866,7 +872,7 @@ func updateBrightness() {
         set("brightness") {
             $0.drawing = true
             $0.icon = "\u{F0594}"
-            $0.iconColor = palette.muted
+            $0.iconColor = \.muted
             $0.label = "−\(Int((shade * 100).rounded()))%"
         }
         return
@@ -2458,12 +2464,37 @@ func appIcon(_ name: String) -> NSImage? {
     return icon
 }
 
-let barHeight: CGFloat = 34
+// The bar owns the menu-bar strip, so it is as tall as the strip macOS
+// draws rather than a number tuned to one release — Tahoe changed the
+// height and it can change again. NSMenu.menuBarHeight keeps reporting
+// it while the native bar is auto-hidden, which is the state
+// macos-defaults.sh puts it in and where visibleFrame and
+// safeAreaInsets both read 0. It needs a main menu to read from, and an
+// .accessory app never displays one. Top-level code runs in order, so
+// the menu is set here rather than with the app setup further down.
+NSApplication.shared.mainMenu = NSMenu()
+let barHeight: CGFloat = NSApplication.shared.mainMenu?.menuBarHeight ?? 34
+
+// Heights inside the bar follow it instead of being tuned to it, so a
+// release that moves the strip does not leave them adrift. The offsets
+// are the ones the fixed values had at a 34 point bar, so a machine
+// reporting 34 draws exactly what it draws today. Widths are unrelated
+// to the strip and stay fixed.
 let padLeft: CGFloat = 10
 let chipBox: CGFloat = 20
 let chipPad: CGFloat = 2
-let pillHeight: CGFloat = 26
-let chipPillHeight: CGFloat = 20
+let pillHeight: CGFloat = barHeight - 8
+// The workspace chip is a SQUARE, which is what a 20x20 chipBox and a
+// 20 chipPillHeight meant at the shipped bar height. Deriving the height
+// from barHeight alone turned it into a rectangle on any shorter bar and
+// shrank the icon with it. Track chipBox instead, and only give way when
+// the bracket is too short to hold it.
+let chipPillHeight: CGFloat = min(chipBox, pillHeight - 2)
+let chipIcon: CGFloat = chipPillHeight - 2
+// A 4 point radius on a 20 point square reads as a rounded rectangle.
+// Roughly a quarter of the side is what makes it read as a rounded
+// square, which is the shape an app icon already is.
+let chipRadius: CGFloat = chipPillHeight * 0.28
 let radius: CGFloat = 4
 let gap: CGFloat = 14
 
@@ -2577,7 +2608,9 @@ final class BarView: NSView {
         // apple pill: the system menu the hidden native menu bar carried
         let appleGlyph = "\u{f179}"
         let appleFont = nerdFont("Bold", 15)
-        let appleW = inkBox(appleGlyph, appleFont).width + 20
+        // A square, like the icon-only pills at the other end. The left
+        // edge stays at padLeft, so only the inner edge moves.
+        let appleW = pillHeight
         let apple = NSRect(x: padLeft, y: (barHeight - pillHeight) / 2, width: appleW, height: pillHeight)
         palette.itemBG.setFill()
         NSBezierPath(roundedRect: apple, xRadius: radius, yRadius: radius).fill()
@@ -2602,17 +2635,19 @@ final class BarView: NSView {
                 let pill = NSRect(x: box.minX, y: (barHeight - chipPillHeight) / 2,
                                   width: chipBox, height: chipPillHeight)
                 palette.accent.setFill()
-                NSBezierPath(roundedRect: pill, xRadius: radius, yRadius: radius).fill()
+                NSBezierPath(roundedRect: pill, xRadius: chipRadius, yRadius: chipRadius).fill()
             }
             let tint: NSColor = ws == surface.visible ? palette.barBG : palette.muted
             switch workspaceIconConfig.icon(for: ws) {
             case .some(.glyph(let glyph)):
                 drawIcon(glyph, iconFont, tint, centeredIn: box)
             case .some(.image(let icon)):
-                icon.draw(in: NSRect(x: box.midX - 9, y: barHeight / 2 - 9, width: 18, height: 18))
+                icon.draw(in: NSRect(x: box.midX - chipIcon / 2, y: (barHeight - chipIcon) / 2,
+                                     width: chipIcon, height: chipIcon))
             case .some(.unavailable), .none:
                 if let app = model.soleApp[ws], let icon = appIcon(app) {
-                    icon.draw(in: NSRect(x: box.midX - 9, y: barHeight / 2 - 9, width: 18, height: 18))
+                    icon.draw(in: NSRect(x: box.midX - chipIcon / 2, y: (barHeight - chipIcon) / 2,
+                                         width: chipIcon, height: chipIcon))
                 } else {
                     draw(String(ws.suffix(1)), chipFont, tint, centeredIn: box)
                 }
@@ -2650,27 +2685,29 @@ final class BarView: NSView {
             guard let item = rightItems[name], item.drawing,
                   !(item.icon.isEmpty && item.label.isEmpty) else { continue }
             let labelFont = chipFont
-            let iconColor = item.iconColor ?? palette.label
+            let iconColor = item.iconColor.map { palette[keyPath: $0] } ?? palette.label
             let hasIcon = !item.icon.isEmpty
             let hasLabel = !item.label.isEmpty
-            // An icon-only pill is sized and centred on the glyph's INK, so
-            // a lopsided side bearing cannot push it off centre. A pill with
-            // a label flows icon-then-text, and the gap between them exists
+            // An icon-only pill is a square, like the apple pill, with the
+            // glyph centred on its INK. A pill with a label flows
+            // icon-then-text, and the gap between them exists
             // only when both do — the weather pill has no icon (its glyph
             // lives in the label) and inherited the gap anyway, which is the
             // 7 px it sat right of centre by.
             let iconInk = hasIcon ? inkBox(item.icon, iconFont).width : 0
             let labelAdv = hasLabel ? advance(item.label, labelFont) : 0
             let innerGap: CGFloat = hasIcon && hasLabel ? 7 : 0
-            let width = 10 + iconInk + innerGap + labelAdv + 10
+            let square = hasIcon && !hasLabel
+            let width = square ? pillHeight : 10 + iconInk + innerGap + labelAdv + 10
             let pill = NSRect(x: cursor - width, y: (barHeight - pillHeight) / 2,
                               width: width, height: pillHeight)
             palette.itemBG.setFill()
             NSBezierPath(roundedRect: pill, xRadius: radius, yRadius: radius).fill()
             if hasIcon {
                 drawIcon(item.icon, iconFont, iconColor,
-                         centeredIn: NSRect(x: pill.minX + 10, y: pill.minY,
-                                            width: iconInk, height: pill.height))
+                         centeredIn: square ? pill
+                             : NSRect(x: pill.minX + 10, y: pill.minY,
+                                      width: iconInk, height: pill.height))
             }
             if hasLabel {
                 drawText(item.label, labelFont, palette.label,
@@ -2908,22 +2945,38 @@ func monitorIDs() -> [String: String] { // display name -> WM monitor id
     return map
 }
 
-func rebuildSurfaces() {
-    let wm = omniwmActive() ? "omniwm" : "aerospace"
-    let ids = monitorIDs()
+// A label no window manager gave: unique per display, and it matches no
+// WM id, so the display's workspace pills stay empty until one answers.
+func unresolvedID(_ screen: NSScreen) -> String { "unresolved:\(screenID(screen))" }
+
+// One bar per display, always; the window manager only labels them. A
+// display the manager does not list (not up yet, a login, a switch) is
+// unresolved: its workspace pills stay empty rather than show another
+// manager's state. reconcile() below asks again.
+func rebuildSurfaces(_ ids: [String: String]) {
+    let wm = labelsFromOmniWM ? "omniwm" : "aerospace"
     var kept: [BarSurface] = []
     for screen in NSScreen.screens {
-        guard let id = ids[screen.localizedName] else { continue }
-        if let existing = surfaces.first(where: { screenID($0.screen) == screenID(screen) }) {
+        let existing = surfaces.first(where: { screenID($0.screen) == screenID(screen) })
+        let id = ids[screen.localizedName] ?? unresolvedID(screen)
+        let label = id.hasPrefix("unresolved:") ? "no window manager yet" : "\(wm) monitor \(id)"
+        if let existing {
             if existing.monitorID != id {
-                tlog("monitor: \(screen.localizedName) is now \(wm) monitor \(id) (was \(existing.monitorID))")
+                tlog("monitor: \(screen.localizedName) is now \(label) (was \(existing.monitorID))")
                 existing.monitorID = id
+                // the old manager's workspaces name nothing now, and apply()
+                // keeps a list it is not given: clear them for the placeholder
+                if id.hasPrefix("unresolved:") {
+                    existing.workspaces = []
+                    existing.mine = []
+                    existing.visible = ""
+                }
             }
             existing.screen = screen
             existing.place()
             kept.append(existing)
         } else {
-            tlog("surface: \(screen.localizedName) -> \(wm) monitor \(id)\(screen.safeAreaInsets.top > 0 ? " (notched)" : "")")
+            tlog("surface: \(screen.localizedName) -> \(label)\(screen.safeAreaInsets.top > 0 ? " (notched)" : "")")
             kept.append(BarSurface(screen: screen, monitorID: id))
         }
     }
@@ -3198,16 +3251,29 @@ func omniWorkspaceBarEvent(_ line: Data) {
                 Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000))
 }
 
+var omniWatchStarting = false
 func startOmniWatch() {
-    guard omniWatch == nil, omniwmActive() else { return }
+    guard omniWatch == nil, !omniWatchStarting, omniwmActive() else { return }
+    omniWatchStarting = true
     // a bar killed by launchd (kickstart -k is SIGKILL) leaves its
     // stream child alive under pid 1, one per restart — reap orphans
-    // before spawning ours; -P 1 cannot touch a living bar's child
-    let reap = Process()
-    reap.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-    reap.arguments = ["-P", "1", "-f", "omniwmctl watch workspace-bar"]
-    try? reap.run()
-    reap.waitUntilExit()
+    // before spawning ours; -P 1 cannot touch a living bar's child.
+    // pkill is waited for, so off the main thread.
+    DispatchQueue.global(qos: .utility).async {
+        let reap = Process()
+        reap.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        reap.arguments = ["-P", "1", "-f", "omniwmctl watch workspace-bar"]
+        try? reap.run()
+        reap.waitUntilExit()
+        DispatchQueue.main.async {
+            omniWatchStarting = false
+            guard omniWatch == nil, omniwmActive() else { return }
+            spawnOmniWatch()
+        }
+    }
+}
+
+func spawnOmniWatch() {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: omniwmctlBin)
     p.arguments = ["watch", "workspace-bar", "--exec", "/bin/cat"]
@@ -3248,26 +3314,91 @@ func stopOmniWatch() {
     p.terminate()
 }
 
-// The WM itself can change under the bar: omacosy-wm-switch quits one and
-// launches the other, and OmniWM.app appearing or vanishing is the
-// signal. Monitor ids have to be re-resolved — the two WMs name the same
-// display differently ("2" vs "display:…") — and the retries cover the
-// incoming WM still booting when the first attempt asks; a switch that
-// reverts fires this again from the other side.
-for event in [NSWorkspace.didLaunchApplicationNotification,
-              NSWorkspace.didTerminateApplicationNotification] {
-    NSWorkspace.shared.notificationCenter.addObserver(forName: event, object: nil, queue: .main) { note in
-        guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-              app.bundleIdentifier == omniwmBundleID else { return }
-        let launched = event == NSWorkspace.didLaunchApplicationNotification
-        tlog("wm: OmniWM \(launched ? "launched" : "quit")")
-        if launched { startOmniWatch() } else { stopOmniWatch() }
-        for delay in [1.0, 3.0, 8.0, 15.0] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                rebuildSurfaces()
-                kickRebuild()
+// ONE routine owns which window manager labels the bar. Both managers are
+// LSUIElement, so NSWorkspace posts no launch or quit for them; the list of
+// running apps is KVO-observable and does change, which is the event. It
+// starts or stops the OmniWM watch, drops the old manager's labels on a
+// switch (they name nothing now), asks the manager for display ids and its
+// focused workspace off the main thread, and while a display is unresolved
+// or the focused workspace is not yet confirmed retries with backoff
+// (1, 2, 4, 8, 15, 30 s, then stops). An app switch, a screen change or
+// the managers changing start it again from the first step.
+let aerospaceBundleID = "bobko.aerospace"
+func runningWMs() -> [Bool] {
+    [omniwmActive(), !NSRunningApplication.runningApplications(withBundleIdentifier: aerospaceBundleID).isEmpty]
+}
+var labelsFromOmniWM = omniwmActive()
+var wmApps = runningWMs()
+let reconcileBackoff: [Double] = [1, 2, 4, 8, 15, 30]
+var reconcileStep = 0
+var reconcileRetry: DispatchWorkItem?
+func anyUnresolved() -> Bool { surfaces.contains { $0.monitorID.hasPrefix("unresolved:") } }
+// the focused workspace as the manager itself reports it (blocking: off-main)
+func managerFocused(_ omni: Bool) -> String {
+    omni
+        ? ((omniQuery("workspaces", ["--focused", "--fields", "raw-name"])?["workspaces"]
+            as? [[String: Any]])?.first?["rawName"] as? String ?? "")
+        : aerospace(["list-workspaces", "--focused"]).trimmingCharacters(in: .whitespacesAndNewlines)
+}
+// After a switch the ring shows what the OLD manager had focused, and the
+// new one's stream can start before it answers at all. So reconcile asks the
+// new manager directly, off the main thread, and keeps asking on its own
+// backoff until two answers in a row agree with the ring. An empty answer
+// (still starting, or a missed reply) does not count.
+var refocusAgreed = 2   // 2 = nothing to confirm
+func reconcile(_ why: String, restart: Bool = true) {
+    let omni = omniwmActive()
+    if omni { startOmniWatch() } else { stopOmniWatch() }
+    // after a switch, or once a display resolves, the ring still shows the
+    // workspace the OLD manager had focused: ask the new one
+    if omni != labelsFromOmniWM || anyUnresolved() { refocusAgreed = 0 }
+    let refocus = refocusAgreed < 2
+    if omni != labelsFromOmniWM {
+        labelsFromOmniWM = omni
+        tlog("wm: now \(omni ? "omniwm" : "aerospace") (\(why)), relabelling the bar")
+        rebuildSurfaces([:])
+        repaint()
+    }
+    if restart { reconcileStep = 0 }
+    reconcileRetry?.cancel()
+    reconcileRetry = nil
+    rebuildQueue.async {
+        let ids = monitorIDs()
+        let focused = refocus ? managerFocused(omni) : ""
+        DispatchQueue.main.async {
+            guard omniwmActive() == omni else { return } // a newer call owns it
+            rebuildSurfaces(ids)
+            if refocus, !focused.isEmpty {
+                if focused == model.focused {
+                    refocusAgreed += 1
+                } else {
+                    setFocused(focused)
+                    repaint()
+                    tlog("wm: focused workspace \(focused), from the manager")
+                    refocusAgreed = 0
+                }
             }
+            kickRebuild()
+            let unresolved = anyUnresolved()
+            guard unresolved || refocusAgreed < 2, reconcileStep < reconcileBackoff.count else { return }
+            let delay = reconcileBackoff[reconcileStep]
+            reconcileStep += 1
+            tlog("wm: \(unresolved ? "display unresolved" : "focus not confirmed"), asking again in \(Int(delay)) s")
+            let retry = DispatchWorkItem { reconcile("retry", restart: false) }
+            // two calls in flight both land here: keep only the newest retry
+            reconcileRetry?.cancel()
+            reconcileRetry = retry
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: retry)
         }
+    }
+}
+let wmAppsWatch = NSWorkspace.shared.observe(\.runningApplications, options: []) { _, _ in
+    DispatchQueue.main.async {
+        let now = runningWMs()
+        guard now != wmApps else { return }
+        wmApps = now
+        tlog("wm: omniwm \(now[0] ? "up" : "down"), aerospace \(now[1] ? "up" : "down")")
+        reconcile("wm-apps")
     }
 }
 
@@ -3279,10 +3410,41 @@ NSWorkspace.shared.notificationCenter.addObserver(
     guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
           let name = app.localizedName, name != model.frontApp,
           app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
+    // someone is using the Mac: an unresolved display is worth asking about now
+    if anyUnresolved() { reconcile("activation") }
     model.frontApp = name
     repaint()
     let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
     tlog(String(format: "frontapp %@ %.2f ms", name, ms))
+}
+
+// A display that was unplugged during a theme change, or plugged in while
+// the machine was off, shows the theme before it: macOS keeps the desktop
+// picture per display, and a theme change only reaches the screens
+// attached at the time. The helper puts the recorded picture back.
+//
+// Twice: once now, and once after macOS has finished adopting the
+// display, because a picture set too early does not stick. The second
+// run is free when the first one worked — resync skips a screen that
+// already has the right picture.
+func resyncWallpaper() {
+    for delay in [0.0, 4.0] {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) {
+            let out = shell("\(NSHomeDirectory())/.local/bin/omacosy-helper", ["wallpaper", "resync"])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !out.isEmpty else { return }
+            DispatchQueue.main.async { tlog(out) }
+        }
+    }
+}
+
+// Its own count, apart from monitorCount below: that one moves only after
+// the grace, and this one must be able to move before it.
+var resyncedCount = NSScreen.screens.count
+func resyncIfGained() {
+    let now = NSScreen.screens.count
+    if now > resyncedCount { resyncWallpaper() }
+    resyncedCount = now
 }
 
 // Displays come and go: re-resolve which aerospace monitor this screen is
@@ -3294,8 +3456,8 @@ NSWorkspace.shared.notificationCenter.addObserver(
 // AeroSpace parks workspaces 11-19 on the one display, and omacosy-ws
 // only ever matches single-digit slots — so anything left on a guest
 // workspace is unreachable by Super+N or Super+Tab until a display
-// comes back. omacosy-ws-collapse moves those windows into the empty
-// 1-9 slots and remembers where they came from.
+// comes back. omacosy-ws-collapse moves those windows into
+// 1-9 and remembers where they came from.
 //
 // It used to be driven by sketchybar's display_change.sh, which went
 // out with sketchybar; nothing has called it since, so the first undock
@@ -3308,38 +3470,40 @@ var monitorCount = NSScreen.screens.count
 NotificationCenter.default.addObserver(
     forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
 ) { _ in
+    // At once, not after the grace below: until it runs, the new screen
+    // shows the old theme. Checked again after the grace, in case the
+    // count had not moved yet when the notification arrived.
+    resyncIfGained()
     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+        resyncIfGained()
         closePopup() // its anchor may not exist any more
-        rebuildSurfaces()
+        var known: [String: String] = [:] // two identical monitors share a name
+        for surface in surfaces { known[surface.screen.localizedName] = surface.monitorID }
+        rebuildSurfaces(known)
         applyShade() // a new display arrives at full output
-        kickRebuild()
-        // the 1 s grace can still lose the race with the WM adopting
-        // the new display — its monitor id resolves to nothing and the
-        // screen stays barless (the Dell did, on replug). Same retry
-        // ladder the WM-switch path uses.
-        for delay in [3.0, 8.0] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                rebuildSurfaces()
-                applyShade()
-                kickRebuild()
-            }
-        }
+        // the WM can adopt the new display after this grace: reconcile asks
+        // again until it answers, with its own backoff
+        reconcile("screens")
         let now = NSScreen.screens.count
         guard now != monitorCount else { return }
-        let wasSingle = monitorCount == 1
         monitorCount = now
-        let op = now == 1 ? "collapse" : (wasSingle ? "restore" : "")
-        guard !op.isEmpty else { return }
-        // both WMs: OmniWM re-routes guest WORKSPACES on unplug but
-        // strands their windows "after 9" — ws-collapse has an omniwm
-        // branch that folds and restores them through omacosy-omni
-        tlog("displays: \(now) — running ws-collapse \(op)")
-        // off-main: it shells out to aerospace per window, and restore
-        // deliberately sleeps while aerospace re-adopts the monitor
-        DispatchQueue.global(qos: .userInitiated).async {
-            _ = shell("\(NSHomeDirectory())/.local/bin/omacosy-ws-collapse", [op])
-            DispatchQueue.main.async { kickRebuild() }
-        }
+        syncWorkspaceFold("displays: \(now)")
+    }
+}
+
+// Fold or unfold to match the screens there are now. ws-collapse waits
+// for the WM to agree on the count and does nothing when nothing is out
+// of place, so calling it more often than needed costs nothing — and a
+// call that raced the WM, or landed mid-sleep, is caught by the next.
+// both WMs: OmniWM re-routes guest WORKSPACES on unplug but strands
+// their windows "after 9"; ws-collapse folds them into 1-9.
+func syncWorkspaceFold(_ why: String) {
+    let n = NSScreen.screens.count
+    tlog("\(why) — running ws-collapse sync \(n)")
+    // off-main: it waits for the WM (up to 30 s) and moves window by window
+    DispatchQueue.global(qos: .userInitiated).async {
+        _ = shell("\(NSHomeDirectory())/.local/bin/omacosy-ws-collapse", ["sync", "\(n)"])
+        DispatchQueue.main.async { kickRebuild() }
     }
 }
 
@@ -3566,10 +3730,19 @@ locationGate.start()
 // bluetooth: gated on the privacy grant, which the watcher above also needs
 bluetoothWatcher.start()
 
-// waking clears the gamma table, so the shade has to be reasserted
+// waking clears the gamma table, so the shade has to be reasserted.
+// A monitor unplugged or replugged while asleep is the case the screen
+// notification handles worst: it fires at wake while the WM still holds
+// the old layout. Sync after every wake, once the screens have settled.
 NSWorkspace.shared.notificationCenter.addObserver(
     forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-) { _ in applyShade() }
+) { _ in
+    applyShade()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+        monitorCount = NSScreen.screens.count
+        syncWorkspaceFold("wake")
+    }
+}
 
 // media: Spotify broadcasts every state change itself, and the payload
 // already carries the track — so the pill repaints without asking anyone
@@ -3606,18 +3779,14 @@ Timer.scheduledTimer(withTimeInterval: 1800, repeats: true) { _ in updateWeather
 model.frontApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
 // startup only: from here the fast paths keep it — the hook file under
 // aerospace, the watch stream under omniwm
-model.focused = omniwmActive()
-    ? ((omniQuery("workspaces", ["--focused", "--fields", "raw-name"])?["workspaces"]
-        as? [[String: Any]])?.first?["rawName"] as? String ?? "")
-    : aerospace(["list-workspaces", "--focused"])
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-rebuildSurfaces()
+model.focused = managerFocused(omniwmActive())
+rebuildSurfaces(monitorIDs())
 guard !surfaces.isEmpty else {
-    FileHandle.standardError.write("omacosy-bar: no display matched \(omniwmActive() ? "an omniwm" : "an aerospace") monitor\n".data(using: .utf8)!)
+    FileHandle.standardError.write("omacosy-bar: no display\n".data(using: .utf8)!)
     exit(1)
 }
 apply(fetchSnapshot()) // blocking is fine here: the run loop has not started
-rightItems["activity"] = BarItem(icon: "󰍛", iconColor: palette.accent)
+rightItems["activity"] = BarItem(icon: "󰍛", iconColor: \.accent)
 applyShade() // restore the level this machine was left at
 updateBattery()
 updateBrightness()
@@ -3625,6 +3794,7 @@ updateWifi()
 updateWeather()
 repaint()
 primeMedia()
-startOmniWatch() // a no-op under aerospace; the WM observer handles switches
+reconcile("startup") // the OmniWM watch, and retries for a manager not up yet
+resyncWallpaper() // a display plugged in while the machine was off missed the last theme change
 tlog("omacosy-bar up on " + surfaces.map { "\($0.screen.localizedName)=m\($0.monitorID)\($0.notched ? " (notched)" : "")" }.joined(separator: ", "))
 app.run()

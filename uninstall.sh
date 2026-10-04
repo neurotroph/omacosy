@@ -13,11 +13,31 @@ log() { printf '\033[1;33m==>\033[0m %s\n' "$*"; }
 MANIFEST="$HOME/.local/state/omacosy/manifest"
 have() { [ -f "$MANIFEST" ] && grep -qxF "$1" "$MANIFEST"; }
 
+# Copied first, before anything is removed, and named at the end: your
+# settings, the record of what omacosy installed, the karabiner.json it
+# wrote, and your own app choices in the clone.
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BACKUP="$HOME/omacosy-backup-$(date +%Y%m%d-%H%M%S)"
+backup() { # <path> <name in the backup>
+  [ -e "$1" ] || return 0
+  mkdir -p "$BACKUP"
+  cp -R "$1" "$BACKUP/$2" 2>/dev/null || log "WARNING: could not back up $1"
+}
+backup "$HOME/.config/omacosy" config-omacosy
+backup "$HOME/.local/state/omacosy" state-omacosy
+backup "$HOME/.config/karabiner/karabiner.json" karabiner.json
+backup "$REPO_DIR/config/apps.local.conf" apps.local.conf
+
 # --- 1. Stop the stack ------------------------------------------------------
 # Quitting the window manager restores windows it was managing —
 # whichever of the two is running (the OmniWM trial branch may have
 # either live; pkill backstops OmniWM's quit handler).
 log "Stopping AeroSpace/OmniWM, the bar, borders"
+# omacosy's own permission entries go while the bundles still exist:
+# tccutil finds a bundle only through the app it names
+for id in com.omacosy.bar com.omacosy.gesture com.omacosy.ffm; do
+  tccutil reset All "$id" >/dev/null 2>&1 || true
+done
 osascript -e 'quit app "AeroSpace"' 2>/dev/null || true
 osascript -e 'quit app "OmniWM"' 2>/dev/null || true
 pkill -f OmniWM.app 2>/dev/null || true
@@ -26,6 +46,7 @@ launchctl unload "$HOME/Library/LaunchAgents/com.omacosy.borders.plist" 2>/dev/n
 rm -f "$HOME/Library/LaunchAgents/com.omacosy.borders.plist" "$HOME/.local/bin/omacosy-borders"
 launchctl unload "$HOME/Library/LaunchAgents/com.omacosy.ffm.plist" 2>/dev/null || true
 rm -f "$HOME/Library/LaunchAgents/com.omacosy.ffm.plist" "$HOME/.local/bin/omacosy-ffm"
+rm -rf "$HOME/.local/share/omacosy/omacosy-ffm.app"
 launchctl unload "$HOME/Library/LaunchAgents/com.omacosy.dwindle.plist" 2>/dev/null || true
 rm -f "$HOME/Library/LaunchAgents/com.omacosy.dwindle.plist" "$HOME/.local/bin/omacosy-dwindle"
 launchctl unload "$HOME/Library/LaunchAgents/com.omacosy.bar.plist" 2>/dev/null || true
@@ -57,6 +78,7 @@ rm -f /tmp/omacosy-*.log /tmp/omacosy-*.err /tmp/omacosy-bar-ws \
   "/tmp/omacosy-overview-$(id -u).pid" "/tmp/omacosy-overlay-active-$(id -u)" \
   "/tmp/omacosy-user-intent-$(id -u)" "/tmp/omacosy-split-state-$(id -u)" \
   "/tmp/omacosy-guard-bounce-$(id -u)" "/tmp/omacosy-guard-cooldown-$(id -u)" \
+  "/tmp/omacosy-ffm-prompted-$(id -u)" \
   "${TMPDIR:-/tmp}/omacosy-monitor-count" 2>/dev/null || true
 rmdir "/tmp/omacosy-spawn-$(id -u).lock.d" 2>/dev/null || true
 # Only the files the installer wrote: this directory is the user's, and
@@ -88,8 +110,17 @@ if [ -f "$MANIFEST" ] && grep -q '^default ' "$MANIFEST"; then
   while read -r _ domain key type value; do
     if [ "$type" = "ABSENT" ]; then
       defaults delete "$domain" "$key" 2>/dev/null || true
-    else
-      defaults write "$domain" "$key" "-$type" "$value" 2>/dev/null || true
+      continue
+    fi
+    # defaults read prints a boolean as 1 or 0, which is how it was
+    # recorded, but defaults write takes only words: 1 printed defaults'
+    # help text and restored nothing
+    if [ "$type" = boolean ]; then
+      case "$value" in 1) value=true ;; 0) value=false ;; esac
+    fi
+    if { [ -z "$value" ] && [ "$type" != string ]; } \
+       || ! defaults write "$domain" "$key" "-$type" "$value" >/dev/null 2>&1; then
+      log "Could not restore $domain $key (recorded: $type '$value'); check it in System Settings"
     fi
   done < <(grep '^default ' "$MANIFEST")
 else
@@ -125,6 +156,24 @@ restore() {
   fi
 }
 
+# --- ~/.zshrc stub: remove it only when it is exactly what we wrote --------
+# BEFORE the copied-config sweep below: a stock install from a
+# TCC-protected clone marked ~/.zshrc as a copied config, and that rm -rf
+# would take the stub together with any line the user appended to it.
+zshrc_unstub() {
+  local zshrc="$HOME/.zshrc" orig="$HOME/.local/state/omacosy/zshrc-stub.orig"
+  have "wrote-zshrc-stub" || return 0
+  [ -f "$zshrc" ] && [ ! -L "$zshrc" ] || return 0
+  if [ -f "$orig" ] && cmp -s "$zshrc" "$orig"; then
+    rm -f "$zshrc"                  # untouched, and ours to remove
+  else
+    local bak="$zshrc.omacosy-stub.bak.$(date +%Y%m%d%H%M%S)"
+    log "~/.zshrc has lines added since install — kept at $bak"
+    mv "$zshrc" "$bak"
+  fi
+}
+zshrc_unstub
+
 # configs COPIED for TCC-protected clones are ours to delete; the
 # restore() calls below then bring back backups / displaced symlinks
 grep '^copied-config ' "$MANIFEST" 2>/dev/null | sed 's/^copied-config //' |
@@ -135,6 +184,22 @@ restore "$HOME/.config/starship.toml"
 restore "$HOME/.config/aerospace"
 restore "$HOME/.config/omniwm"
 restore "$HOME/.config/ghostty"
+
+# --- ~/.zshrc.local ---------------------------------------------------------
+# Ours to remove ONLY when we created it and it is still an exact copy of
+# the file just restored. Anything else is the user's, and is kept.
+LOCAL_RC="$HOME/.zshrc.local"
+if [ -e "$LOCAL_RC" ]; then
+  if have "created-zshrc-local" && [ -f "$HOME/.zshrc" ] \
+     && cmp -s "$LOCAL_RC" "$HOME/.zshrc"; then
+    rm -f "$LOCAL_RC"
+    log "Removed ~/.zshrc.local — an exact copy of your restored ~/.zshrc"
+  else
+    log "Kept ~/.zshrc.local. Nothing sources it now. To keep using it, add"
+    log "to your ~/.zshrc:"
+    log '    [ -f "$HOME/.zshrc.local" ] && source "$HOME/.zshrc.local"'
+  fi
+fi
 
 # re-enable Karabiner's helper agents we disabled
 for agent in Karabiner-Menu Karabiner-NotificationWindow; do
@@ -152,19 +217,16 @@ else
   rmdir "$HOME/.config/karabiner" 2>/dev/null || true
 fi
 
-# Pre-omacosy, ~/.zshrc pointed at the old dotbot repo — relink if
-# nothing else restored it and that repo is still around.
-if [ ! -e "$HOME/.zshrc" ] && [ -f "$HOME/Documents/config/.dotfiles/zshrc" ]; then
-  log "Relinking ~/.zshrc to the legacy dotfiles repo"
-  ln -s "$HOME/Documents/config/.dotfiles/zshrc" "$HOME/.zshrc"
-fi
-
 # theme-set / theme-next out of ~/.local/bin — only when they are OUR
 # symlinks (a user's own script of the same name survives)
-for t in theme-set theme-next theme-bg-next omacosy-ws omacosy-toggle omacosy-focus-guard omacosy-ws-collapse omacosy-float omacosy-cycle omacosy-update omacosy-spawn omacosy-layout omacosy-wm-switch omacosy-karabiner-omniwm; do
+for t in theme-set theme-next theme-bg-next omacosy-ws omacosy-toggle omacosy-focus-guard omacosy-ws-collapse omacosy-float omacosy-cycle omacosy-update omacosy-spawn omacosy-layout omacosy-finder-window omacosy-browser omacosy-open omacosy-wm-switch omacosy-karabiner-omniwm; do
   target="$(readlink "$HOME/.local/bin/$t" 2>/dev/null || true)"
   case "$target" in *omacosy*) rm -f "$HOME/.local/bin/$t" ;; esac
 done
+# omacosy-files (Super+Shift+Y, yazi), by the same rule: only a link into a clone
+case "$(readlink "$HOME/.local/bin/omacosy-files" 2>/dev/null || true)" in
+  *omacosy*) rm -f "$HOME/.local/bin/omacosy-files" ;;
+esac
 
 # Put the pre-omacosy wallpaper back — theme-set overwrote every display
 # and the picture would otherwise stay as a souvenir. Restores only when
@@ -211,6 +273,19 @@ if [ -f "$MANIFEST" ] && grep -qE '^brew-(formula|cask) ' "$MANIFEST"; then
   grep '^brew-cask ' "$MANIFEST" | awk '{print $2}' \
     | xargs -n1 brew uninstall --cask 2>/dev/null || true
 fi
+# --yazi-full linked ffmpeg-full and imagemagick-full over the user's own
+# plain formula; with the -full one gone, link the plain one again
+grep '^brew-relink ' "$MANIFEST" 2>/dev/null | awk '{print $2}' | while read -r f; do
+  brew list --formula "$f" >/dev/null 2>&1 || continue
+  # brew may still count it as linked, and then `brew link` does nothing
+  brew unlink "$f" >/dev/null 2>&1
+  brew link --overwrite "$f" >/dev/null 2>&1 && log "Linked your $f again" \
+    || log "WARNING: could not link $f again; run: brew link --overwrite $f"
+done
+# the login item would point at an app that is gone
+if [ ! -d /Applications/OmniWM.app ]; then
+  osascript -e 'tell application "System Events" to if exists login item "OmniWM" then delete login item "OmniWM"' >/dev/null 2>&1 || true
+fi
 if have "installed-homebrew"; then
   echo "Note: Homebrew itself was installed by omacosy; remove it with the"
   echo "official uninstall script if you don't want it."
@@ -229,10 +304,21 @@ Done. Left in place on purpose:
   - If AeroSpace still appears in System Settings -> General -> Login Items, remove it there.
   - OmniWM.app is a brew cask like the rest: removed above only when the
     manifest says omacosy installed it; one that predates omacosy stays.
-  - Permission entries (Accessibility, Input Monitoring, Screen Recording,
-    Location, Bluetooth) stay listed in System Settings -> Privacy &
-    Security — macOS lets no script remove them. The binaries they named
-    are gone, so the entries are inert; delete them there if you want the
-    lists clean.
+  - Permission entries: those of the bar, omacosy-gesture and omacosy-ffm
+    were removed above. Entries of plain programs (omacosy-overview, older
+    installs) stay listed in System Settings -> Privacy & Security, because
+    macOS lets a script remove only an app's entries. The programs they
+    named are gone, so the entries are inert; delete them there if you want
+    the lists clean.
   - The repo itself and your shell tools (fzf, eza, zoxide, ...) are untouched.
 EOF
+
+if [ -d "$BACKUP" ]; then
+  echo
+  log "Your settings and the record of this install are saved in:"
+  log "  $BACKUP"
+fi
+# this window's shell still runs the setup omacosy installed, and the
+# prompt it draws with (starship) may just have been removed
+echo
+log "Open a new terminal window now: this one still uses omacosy's shell setup."

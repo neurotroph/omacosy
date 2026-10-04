@@ -1,6 +1,8 @@
 #!/bin/bash
 # omacosy-spawn <App> — open a new window of App, serialized so the
 # dwindle split hint keeps up.
+# omacosy-spawn --cmd <command...> — the same serialization for a
+# window that `open -na` cannot make.
 #
 # The split hint runs AFTER a window exists (on-focus-changed), so two
 # windows created at the same instant both land before any hint can
@@ -10,27 +12,111 @@
 # stamped it into the state file (its first field is the newest hinted
 # window id, and ids only grow) before letting the next spawn go.
 # Spam then becomes a rapid, clean sequence instead of a simultaneous
-# mess. Worst case the wait gives up after 2s so a broken hint chain
+# mess. Worst case the wait gives up after about 5 s so a broken hint chain
 # can never wedge the terminal key.
-APP="$1"
-[ -n "$APP" ] || exit 1
 # ~/.local/state (mode 700), not /tmp — a world-writable directory
 # lets another local uid plant a symlink at a predictable name.
 RUN="$HOME/.local/state/omacosy/run"
 mkdir -p "$RUN"
-STATE="$RUN/split-state"
+
+# A new Ghostty window can come from the instance that is already
+# running. `open -na` is a whole second app instance every time, a full
+# app launch, while Ghostty 1.3's scripting dictionary hands a window
+# over from the one already warm. Time from the key to a window the WM
+# can see: ~140 ms against ~300 ms on the author's Mac; ~225 ms against
+# ~810 ms measured here through OmniWM's window count. The instance
+# count is the other half — three spawns through open(1) left three more
+# ghostty processes behind, the dictionary path none. Ghostty is the
+# terminal this repo ships and Super+Enter is the most pressed chord in
+# the map, so it earns the special case.
+#
+# Everything else, and a Ghostty that is not running yet, goes through
+# open(1): addressing an app that is down would launch it AND let it
+# open its own initial window, which is two windows for one press.
+# Ghostty before 1.3 has no dictionary and raises, landing there too.
+# The directory is pinned to $HOME because that is where open(1) starts
+# one; inheriting the focused window's directory would be a behaviour
+# change riding along with a speed-up.
+# The name is matched literally, so a renamed Ghostty bundle simply
+# takes the open(1) path — slower, never wrong.
+#
+# `with timeout` because this runs while the spawn lock is HELD: an
+# Apple event to a wedged app waits two minutes by default, which would
+# take the terminal key down with it. Five seconds, then the error lands
+# in the same fallback as a missing dictionary.
+spawn_app() {
+  if [ "$1" = Ghostty ] && /usr/bin/osascript \
+    -e 'if application "Ghostty" is running then' \
+    -e 'with timeout of 5 seconds' \
+    -e "tell application \"Ghostty\" to new window with configuration {initial working directory:\"$HOME\"}" \
+    -e 'end timeout' \
+    -e 'else' \
+    -e 'error "Ghostty is not running"' \
+    -e 'end if' >/dev/null 2>&1; then
+    return 0
+  fi
+  open -na "$1"
+}
+
+# --cmd exists because of Finder. Finder is always running, so
+# `open -na Finder` fails with "Launch failed"; a new Finder window
+# takes AppleScript instead. That spawn needs this lock exactly as
+# much: measured, four at once ran the split hint ONCE and left five
+# windows in one flat row. Only the command differs, so only the
+# command is a parameter.
+if [ "${1:-}" = "--cmd" ]; then
+  shift
+  [ "$#" -gt 0 ] || exit 1
+  SPAWN=("$@")
+else
+  [ -n "${1:-}" ] || exit 1
+  # a function name works here as any command does, so the default keeps
+  # the Ghostty fast path and --cmd keeps its own command
+  SPAWN=(spawn_app "$1")
+fi
 
 # macOS ships no flock; mkdir is the portable atomic lock. Both WM
-# paths need the same serialization, so it is taken ONCE here. A
-# holder that died is stolen after ~5s so the terminal key can never
-# go dead.
+# paths need the same serialization, so it is taken ONCE here.
+#
+# The holder writes its pid inside, because a spawn really does get
+# killed outright: Karabiner runs one shell_command at a time and
+# SIGKILLs the one still running when the next key arrives. SIGKILL
+# runs no EXIT trap, so a lock without an owner recorded in it outlives
+# the process that took it, and every later press then waits on
+# something that is already gone. A waiter that finds a dead holder
+# clears the lock immediately instead. The pid lands just after the
+# mkdir, so an empty one is re-read after a beat before it counts.
+#
+# The timers are wall clock. The old one counted 120 sleeps of 0.05 and
+# called that 5 s; a turn really costs ~130 ms, so it did not fire until
+# 13 s. It also fell through and ran WITHOUT the lock while its trap
+# still removed whatever lock it found, including one another spawn was
+# holding. Releasing is now owner-checked, so falling through is harmless.
+#
+# A LIVE holder is taken over only when its lock is over 15 s old: the
+# longest real hold is the 5 s AppleScript cap plus the 2 s window wait,
+# so before that the liveness check decides. The age is the lock's, not
+# the waiter's, so after one takeover the other waiters see a new lock
+# and wait for it instead of deleting it too. Every turn sleeps.
 LOCK="$RUN/spawn.lock.d"
-for i in $(seq 120); do
-  mkdir "$LOCK" 2>/dev/null && break
-  [ "$i" -ge 100 ] && { rm -rf "$LOCK"; }
+read_owner() { owner=""; [ -r "$LOCK/pid" ] && read -r owner < "$LOCK/pid"; }
+trap 'read_owner; [ "$owner" = "$$" ] && rm -rf "$LOCK"' EXIT
+start=$SECONDS
+while :; do
+  mkdir "$LOCK" 2>/dev/null && { echo $$ > "$LOCK/pid"; break; }
+  read_owner
+  [ -z "$owner" ] && { sleep 0.05; read_owner; }
+  case "$owner" in
+    ""|*[!0-9]*) rm -rf "$LOCK" ;;
+    *) if ! kill -0 "$owner" 2>/dev/null; then
+         rm -rf "$LOCK"
+       elif [ $(( $(date +%s) - $(stat -f %m "$LOCK/pid" 2>/dev/null || date +%s) )) -ge 15 ]; then
+         rm -rf "$LOCK"
+       fi ;;
+  esac
+  [ $(( SECONDS - start )) -ge 30 ] && break   # never wedge the key: go on unlocked
   sleep 0.05
 done
-trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
 # Under OmniWM the split is native, but its insertion side is not
 # omarchy's: with smartSplit off a new window goes RIGHT in horizontal
@@ -53,6 +139,7 @@ if wm_is_omniwm; then
   mult="$(sed -n 's/^splitWidthMultiplier = //p' "$HOME/.config/omniwm/settings.toml" 2>/dev/null | head -1)"
   "$OMNI" preselect-for-focused "${mult:-1.4}" >/dev/null 2>&1 || true
   before="$("$OMNI" window-count 2>/dev/null || echo 0)"
+  prev="$("$OMNI" focused-id 2>/dev/null || true)"
   # the next spawn may go once this window exists: a windows-changed
   # subscription says so the moment it does. Subscribed BEFORE the
   # open — `open -na` can block until the app is up, and a window that
@@ -61,15 +148,45 @@ if wm_is_omniwm; then
   # never shows a window cannot wedge the terminal key.
   "$OMNI" wait-window "$before" 2000 >/dev/null 2>&1 &
   waiter=$!
-  open -na "$APP"
+  # The window existing is not enough: the next spawn's preselect measures
+  # the FOCUSED window, and until this one has taken focus and its tile has
+  # stopped moving it would measure the previous one and split the wrong way.
+  # A Finder window (AppleScript, then activate) is the slow case; measured,
+  # a burst of three came out as three narrow columns in 4 runs of 5.
+  # Subscribed before the open too, for the same reason as the waiter above.
+  "$OMNI" wait-settled "${prev:-none}" 1500 >/dev/null 2>&1 &
+  settler=$!
+  "${SPAWN[@]}"
   wait "$waiter" 2>/dev/null || true
+  wait "$settler" 2>/dev/null || true
   exit 0
 fi
 
+STATE="$RUN/split-state"
+
+# A refocus read still in flight (field 5 is 0) is about to be checked: the
+# survivor of a close is measured before it re-expands, and split on that
+# stale size. A window opened now joins that container, and once it has,
+# the correction must not split again. So wait for the verdict first. Only
+# a read is ever provisional, so a burst of spawns never waits here.
+settle_by=$(( SECONDS + 2 ))
+while [ -f "$STATE" ] && [ "$SECONDS" -lt "$settle_by" ]; do
+  # the helper writes no line break, so `read` would report end-of-file
+  set -- $(cat "$STATE" 2>/dev/null); ts=${4:-0} verified=${5:-1}
+  [ "$verified" = 0 ] || break
+  [ $(( $(date +%s) - ${ts%.*} )) -lt 3 ] || break
+  sleep 0.05
+done
+
+
 prev=0
 [ -f "$STATE" ] && prev=$(cut -d' ' -f1 "$STATE")
-open -na "$APP"
-for _ in $(seq 40); do
+"${SPAWN[@]}"
+SECONDS_AT_SPAWN=$SECONDS
+# wall clock, as for the lock. The old 40 sleeps of 0.05 were documented
+# as 2 s and measured ~5 s; 5 s is what the tiling has been tuned against,
+# so it stays. SECONDS counts whole seconds: this ends 4 to 5 s after.
+until [ "$SECONDS" -ge $(( SECONDS_AT_SPAWN + 5 )) ]; do
   cur=0
   [ -f "$STATE" ] && cur=$(cut -d' ' -f1 "$STATE")
   [ "${cur%.*}" -gt "${prev%.*}" ] 2>/dev/null && exit 0

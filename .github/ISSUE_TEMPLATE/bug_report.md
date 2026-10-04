@@ -13,11 +13,11 @@ about: Something broken in the omacosy stack
 - Apple Development signing identity present? (install.sh says at build time):
 - Clone location (matters for TCC — `~/Documents` clones copy configs):
 
-**Logs** — the stack writes its diagnostics to `/tmp`. Attach whatever
-exists of:
+**Logs** — the stack writes its diagnostics to
+`~/.local/state/omacosy/run`. Attach whatever exists of:
 
 ```sh
-ls -la /tmp/omacosy-*.log
+ls -la ~/.local/state/omacosy/run/*.log
 ```
 
 For bar issues also paste the failing item's state:

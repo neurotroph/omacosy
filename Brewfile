@@ -1,10 +1,17 @@
 # omacosy — everything the setup needs, installable via `brew bundle`
 
-tap "nikitabobko/tap"        # aerospace
+# The window manager: install.sh --omniwm | --aerospace sets
+# HOMEBREW_OMACOSY_WM, and AeroSpace is the default. The other one installs
+# on first use: omacosy-wm-switch omniwm | aerospace
+wm = ENV.fetch("HOMEBREW_OMACOSY_WM", "aerospace")
+if wm == "omniwm"
+  cask "omniwm"
+else
+  tap "nikitabobko/tap"
+  cask "aerospace"
+end
 
 # Window management + bar + borders
-# (OmniWM is NOT here: `omacosy-wm-switch omniwm` installs it on first use)
-cask "aerospace"
 cask "karabiner-elements"  # Caps Lock -> Super
 cask "ghostty"             # default terminal + floating TUI host (btop)
 cask "raycast"             # Super+Space launcher (the binding assumes it)

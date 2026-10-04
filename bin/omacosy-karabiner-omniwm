@@ -23,19 +23,32 @@ MARK="omacosy-omniwm"                     # rule-description prefix, removal key
 
 [ -f "$KARABINER" ] || { echo "no karabiner.json" >&2; exit 1; }
 
-TERMINAL=Ghostty BROWSER=Safari MUSIC=Spotify MESSENGER=Slack
+TERMINAL=Ghostty BROWSER= MUSIC=Spotify MESSENGER=Slack
 [ -f "$APPS" ] && . "$APPS" 2>/dev/null
 
 export KARABINER MARK TERMINAL BROWSER MUSIC MESSENGER
 python3 - "$1" <<'PY'
-import json, os, sys
+import json, os, shutil, sys
 
 path = os.environ["KARABINER"]
 mark = os.environ["MARK"]
 action = sys.argv[1]
 
+# Karabiner runs ONE shell_command at a time and SIGKILLs the one still
+# running when the next key arrives. Measured on five fast Super+Enter
+# presses: four shells died inside 200 ms each, the fifth survived, and
+# a single window appeared 13 s later — the four dead ones had left the
+# spawn lock behind them. aerospace never had this because exec-and-forget
+# detaches. Backgrounding gives Karabiner a child that exits at once, and
+# the work continues in a process it holds no pid for. Serialization is
+# not lost: omacosy-spawn's lock is what orders a burst, and it can only
+# do that if the spawns live long enough to queue.
+def detached(cmd):
+    return "{ " + cmd + " ; } >/dev/null 2>&1 &"
+
+
 def rule(desc, key, mods, cmd=None, to_key=None, to_mods=None):
-    to = [{"shell_command": cmd}] if cmd else [{"key_code": to_key, "modifiers": to_mods or []}]
+    to = [{"shell_command": detached(cmd)}] if cmd else [{"key_code": to_key, "modifiers": to_mods or []}]
     return {
         "description": f"{mark}: {desc}",
         "manipulators": [{
@@ -64,7 +77,7 @@ rules = slot_rules + [
     # omacosy-spawn preselects the omarchy insertion side and serializes
     # bursts — a bare `open -na` gives OmniWM's above-not-below spiral
     rule("terminal", "return_or_enter", SUPER, cmd=f"{home}/.local/bin/omacosy-spawn '{apps['TERMINAL']}'"),
-    rule("browser", "return_or_enter", SHIFT, cmd=f"open -a '{apps['BROWSER']}'"),
+    rule("browser", "return_or_enter", SHIFT, cmd=f"{home}/.local/bin/omacosy-browser"),
     # trial: OmniWM's command palette on the launcher chord (Raycast
     # parked — swap the two lines to go back)
     rule("launcher", "spacebar", SUPER, cmd="/opt/homebrew/bin/omniwmctl command open-command-palette >/dev/null 2>&1"),
@@ -77,9 +90,16 @@ rules = slot_rules + [
     # the guest workspaces too on a single display
     rule("next workspace", "tab", SUPER, cmd=f"{home}/.local/bin/omacosy-ws next"),
     rule("previous workspace", "tab", SHIFT, cmd=f"{home}/.local/bin/omacosy-ws prev"),
-    rule("files", "f", SHIFT, cmd="open -a Finder"),
+    # a new Finder window per press, through the same spawn lock and
+    # preselect as the terminal; `open -a Finder` only raises one
+    rule("files", "f", SHIFT, cmd=f"{home}/.local/bin/omacosy-finder-window"),
     rule("music", "m", SHIFT, cmd=f"open -a '{apps['MUSIC']}'"),
     rule("messenger", "g", SHIFT, cmd=f"open -a '{apps['MESSENGER']}'"),
+    # the default mail app, or EMAIL when set — the same command aerospace runs
+    rule("email", "e", SHIFT, cmd=f"{home}/.local/bin/omacosy-open mailto"),
+    # yazi, only where it is installed (see omacosy-files)
+    *([rule("yazi", "y", SHIFT, cmd=f"{home}/.local/bin/omacosy-files")]
+      if shutil.which("yazi") or os.path.exists("/opt/homebrew/bin/yazi") else []),
     rule("next theme", "t", SHIFT, cmd=f"{home}/.local/bin/theme-next"),
     rule("next wallpaper", "b", SHIFT, cmd=f"{home}/.local/bin/theme-bg-next"),
     rule("lock", "l", SHIFT, cmd=f"{home}/.local/bin/omacosy-helper lock"),
