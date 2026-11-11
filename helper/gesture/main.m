@@ -822,6 +822,9 @@ int main(int argc, const char* argv[])
 			g_config.swipe_up,
 			g_config.swipe_down);
 
+		// A single connect attempt: the client reconnects on the command
+		// path when it has no fd, so a socket that is not up yet falls back
+		// to the CLI instead of blocking here — before the trackpad is armed.
 		g_aerospace = aerospace_new(NULL);
 		if (!g_aerospace) {
 			fprintf(stderr, "Error: Failed to initialize Aerospace client.\n");

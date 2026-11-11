@@ -1107,6 +1107,7 @@ let bluetoothWatcher = BluetoothWatcher()
 struct Weather {
     var emoji = ""
     var temp = ""
+    var tempUnit = "°C"
     var desc = ""
     var feels = ""
     var low = ""
@@ -1121,6 +1122,31 @@ struct Weather {
 }
 
 var weather: Weather?
+
+struct WeatherPreferences {
+    var fahrenheit = false
+    var location = ""
+}
+
+func loadWeatherPreferences() -> WeatherPreferences {
+    let file = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".config/omacosy/weather.json")
+    guard let data = try? Data(contentsOf: file),
+          let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return WeatherPreferences() }
+
+    var preferences = WeatherPreferences()
+    if (config["unit"] as? String)?.lowercased() == "fahrenheit" {
+        preferences.fahrenheit = true
+    }
+    if let location = config["location"] as? String {
+        let trimmed = location.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty, trimmed.lowercased() != "auto" {
+            preferences.location = trimmed
+        }
+    }
+    return preferences
+}
 
 // WWO condition code -> glyph, night-aware for the clear/partly pair
 func weatherEmoji(_ code: Int, night: Bool) -> String {
@@ -1152,7 +1178,13 @@ func moonEmoji(_ phase: String) -> String {
 }
 
 func updateWeather() {
-    guard let url = URL(string: "https://wttr.in/?format=j1") else { return }
+    let preferences = loadWeatherPreferences()
+    var components = URLComponents()
+    components.scheme = "https"
+    components.host = "wttr.in"
+    components.path = "/" + preferences.location
+    components.queryItems = [URLQueryItem(name: "format", value: "j1")]
+    guard let url = components.url else { return }
     var request = URLRequest(url: url)
     request.timeoutInterval = 15
     URLSession.shared.dataTask(with: request) { data, _, _ in
@@ -1168,13 +1200,15 @@ func updateWeather() {
         }
 
         var w = Weather()
+        let fahrenheit = preferences.fahrenheit
         let hour = Calendar.current.component(.hour, from: Date())
         w.emoji = weatherEmoji(Int(text(current, "weatherCode")) ?? 0, night: hour < 7 || hour >= 20)
-        w.temp = text(current, "temp_C")
+        w.temp = text(current, fahrenheit ? "temp_F" : "temp_C")
+        w.tempUnit = fahrenheit ? "°F" : "°C"
         w.desc = nested(current, "weatherDesc").lowercased()
-        w.feels = text(current, "FeelsLikeC")
-        w.low = text(today, "mintempC")
-        w.high = text(today, "maxtempC")
+        w.feels = text(current, fahrenheit ? "FeelsLikeF" : "FeelsLikeC")
+        w.low = text(today, fahrenheit ? "mintempF" : "mintempC")
+        w.high = text(today, fahrenheit ? "maxtempF" : "maxtempC")
         w.humidity = text(current, "humidity")
 
         // The one place a value off the network reaches an array
@@ -1186,14 +1220,17 @@ func updateWeather() {
         let degrees = Int(text(current, "winddirDegree")) ?? 0
         let arrows = ["↓", "↙", "←", "↖", "↑", "↗", "→", "↘"]
         let arrow = arrows[(((degrees + 180) / 45) % 8 + 8) % 8]
-        w.wind = "\(arrow) \(text(current, "windspeedKmph")) km/h"
+        let wind = text(current, fahrenheit ? "windspeedMiles" : "windspeedKmph")
+        w.wind = "\(arrow) \(wind) \(fahrenheit ? "mph" : "km/h")"
 
         // rain earns a row only with real signal: falling now, or likely today
-        let precip = Double(text(current, "precipMM")) ?? 0
+        let precipitation = text(current, fahrenheit ? "precipInches" : "precipMM")
+        let precip = Double(precipitation) ?? 0
+        let precipUnit = fahrenheit ? "in" : "mm"
         let chance = ((today["hourly"] as? [[String: Any]]) ?? [])
             .compactMap { Int(($0["chanceofrain"] as? String) ?? "0") }.max() ?? 0
         if precip > 0 {
-            w.rain = "☔ \(text(current, "precipMM"))mm now"
+            w.rain = "☔ \(precipitation)\(precipUnit) now"
             if chance >= 30 { w.rain += " · rain \(chance)% today" }
         } else if chance >= 30 {
             w.rain = "☔ rain \(chance)% today"
@@ -1223,7 +1260,7 @@ func updateWeather() {
 
         DispatchQueue.main.async {
             weather = w
-            set("weather") { $0.icon = ""; $0.label = "\(w.emoji) \(w.temp)°C" }
+            set("weather") { $0.icon = ""; $0.label = "\(w.emoji) \(w.temp)\(w.tempUnit)" }
             if openPopup == "weather" { refreshPopup() }
         }
     }.resume()
@@ -1507,7 +1544,10 @@ func calendarRows() -> [PopupRow] {
     let title = DateFormatter()
     title.dateFormat = "MMMM yyyy"
     rows.append(PopupRow(text: title.string(from: now).lowercased(), hero: true))
-    rows.append(PopupRow(text: "mo tu we th fr sa su", dim: true))
+    // header and weeks share one font and one leading marker column, so
+    // the monospace columns line up (a dim row is a point smaller, and an
+    // icon column's width follows its glyph's ink)
+    rows.append(PopupRow(text: "  mo tu we th fr sa su"))
 
     guard let monthStart = cal.date(from: cal.dateComponents([.year, .month], from: now)),
           let range = cal.range(of: .day, in: .month, for: now) else { return rows }
@@ -1527,7 +1567,7 @@ func calendarRows() -> [PopupRow] {
         let slice = cells[week..<min(week + 7, cells.count)]
         let text = slice.map { String(format: "%2d", $0.0) }.joined(separator: " ")
         let hasToday = slice.contains { $0.0 == today && $0.1 }
-        rows.append(PopupRow(icon: hasToday ? "▸" : " ", text: text, highlight: hasToday))
+        rows.append(PopupRow(text: (hasToday ? "▸ " : "  ") + text, highlight: hasToday))
     }
     let week = cal.component(.weekOfYear, from: now)
     rows.append(PopupRow(text: "week \(week)", dim: true))
@@ -1695,11 +1735,11 @@ func bluetoothRows() -> [PopupRow] {
 
 func weatherRows() -> [PopupRow] {
     guard let w = weather else { return [] }
-    var rows: [PopupRow] = [PopupRow(text: "\(w.emoji) \(w.temp)°C \(w.desc)", hero: true)]
+    var rows: [PopupRow] = [PopupRow(text: "\(w.emoji) \(w.temp)\(w.tempUnit) \(w.desc)", hero: true)]
 
     // feels-like earns a mention only when it differs from the real temp
-    var today = "today \(w.low)° → \(w.high)°C"
-    if w.feels != w.temp { today = "feels \(w.feels)°C · " + today }
+    var today = "today \(w.low)° → \(w.high)\(w.tempUnit)"
+    if w.feels != w.temp { today = "feels \(w.feels)\(w.tempUnit) · " + today }
     rows.append(PopupRow(text: today))
     rows.append(PopupRow(text: "wind \(w.wind) · humidity \(w.humidity)%"))
     if !w.rain.isEmpty { rows.append(PopupRow(text: w.rain)) }
@@ -2466,35 +2506,71 @@ func appIcon(_ name: String) -> NSImage? {
 
 // The bar owns the menu-bar strip, so it is as tall as the strip macOS
 // draws rather than a number tuned to one release — Tahoe changed the
-// height and it can change again. NSMenu.menuBarHeight keeps reporting
-// it while the native bar is auto-hidden, which is the state
-// macos-defaults.sh puts it in and where visibleFrame and
-// safeAreaInsets both read 0. It needs a main menu to read from, and an
-// .accessory app never displays one. Top-level code runs in order, so
-// the menu is set here rather than with the app setup further down.
+// height and it can change again. The strip is NOT one height for every
+// display: NSMenu.menuBarHeight reports only the MAIN display's, so on a
+// machine with a notched built-in and a flat external, both bars drew the
+// notch's height while the external's dropdown menus unfold at its own
+// shorter strip — the bar's lower edge stayed outside every menu.
+//
+// The Window Server keeps one Menubar window PER display, at that
+// display's real strip height, and keeps it in the window list even while
+// the native bar is auto-hidden, which is the state macos-defaults.sh
+// puts it in and where visibleFrame and safeAreaInsets both read 0.
+// Auto-hidden, the window sits slid just ABOVE the display's top edge;
+// shown, just below it; the strip always touches that edge, which is the
+// test — next to x and width — so a read during the slide still lands.
+//
+// The Window Server's own row is the one to ask, but MenuBarAgent's row
+// for the same display carries the same height, so accepting either makes
+// the read survive a release that moves the window's owner. The window
+// NAME is not used at all: kCGWindowName is only delivered to processes
+// holding Screen Recording, and the bar has no reason to ask for it.
+// The heights are points already, and a scaled panel's strip measures
+// more than the legacy 24 (a DELL on a scaled mode reports 30 here), so
+// beyond a per-display read there is no constant worth falling back to
+// except the main display's own value.
+//
+// The fallback read needs a main menu, and an .accessory app never
+// displays one. Top-level code runs in order, so the menu is set here
+// rather than with the app setup further down.
 NSApplication.shared.mainMenu = NSMenu()
-let barHeight: CGFloat = NSApplication.shared.mainMenu?.menuBarHeight ?? 34
+let barHeightFallback: CGFloat = NSApplication.shared.mainMenu?.menuBarHeight ?? 34
 
-// Heights inside the bar follow it instead of being tuned to it, so a
-// release that moves the strip does not leave them adrift. The offsets
-// are the ones the fixed values had at a 34 point bar, so a machine
-// reporting 34 draws exactly what it draws today. Widths are unrelated
-// to the strip and stay fixed.
+// Height of the menu-bar strip THIS display draws, in points.
+func menuBarHeight(for screen: NSScreen) -> CGFloat {
+    let primaryH = NSScreen.screens.first?.frame.height ?? 0
+    let topY = primaryH - screen.frame.maxY // the display's top edge, CG space
+    let menuLevel = Int(CGWindowLevelForKey(.mainMenuWindow))
+    guard let list = CGWindowListCopyWindowInfo([], kCGNullWindowID)
+        as? [[String: Any]] else { return barHeightFallback }
+    var agentHeight: CGFloat = 0 // MenuBarAgent's answer, used if the server's is absent
+    for w in list {
+        guard (w[kCGWindowLayer as String] as? Int) == menuLevel,
+              let owner = w[kCGWindowOwnerName as String] as? String,
+              owner == "Window Server" || owner == "MenuBarAgent",
+              let b = w[kCGWindowBounds as String] as? [String: CGFloat],
+              let x = b["X"], let y = b["Y"], let width = b["Width"],
+              let height = b["Height"], height > 0,
+              height < screen.frame.height / 4 // a strip, not a stray window
+        else { continue }
+        // Slid out of view while auto-hidden (its bottom edge on the
+        // display top), slid back in when shown (its top edge there), and
+        // between the two mid-animation, so require the strip to touch
+        // that edge rather than sit at either end of it.
+        if abs(x - screen.frame.minX) < 2, abs(width - screen.frame.width) < 2,
+           y <= topY + 2, y + height >= topY - 2 {
+            if owner == "Window Server" { return height }
+            if agentHeight == 0 { agentHeight = height }
+        }
+    }
+    return agentHeight > 0 ? agentHeight : barHeightFallback
+}
+
+// Widths are unrelated to the strip and stay fixed; the heights inside
+// the bar follow ITS display's strip instead, and live on BarView.
 let padLeft: CGFloat = 10
 let chipBox: CGFloat = 20
 let chipPad: CGFloat = 2
-let pillHeight: CGFloat = barHeight - 8
-// The workspace chip is a SQUARE, which is what a 20x20 chipBox and a
-// 20 chipPillHeight meant at the shipped bar height. Deriving the height
-// from barHeight alone turned it into a rectangle on any shorter bar and
-// shrank the icon with it. Track chipBox instead, and only give way when
-// the bracket is too short to hold it.
-let chipPillHeight: CGFloat = min(chipBox, pillHeight - 2)
-let chipIcon: CGFloat = chipPillHeight - 2
-// A 4 point radius on a 20 point square reads as a rounded rectangle.
-// Roughly a quarter of the side is what makes it read as a rounded
-// square, which is the shape an app icon already is.
-let chipRadius: CGFloat = chipPillHeight * 0.28
 let radius: CGFloat = 4
 let gap: CGFloat = 14
 
@@ -2519,6 +2595,24 @@ final class BarView: NSView {
     var itemRects: [(String, NSRect)] = []
     var mediaRects: [(String, NSRect)] = []
     var appleRect: NSRect = .zero
+
+    // Heights inside this display's bar follow ITS strip, so a release
+    // — or a second display — that moves one does not leave them adrift.
+    // The offsets are the ones the fixed values had at a 34 point bar, so
+    // a machine reporting 34 draws exactly what it drew before.
+    private var barHeight: CGFloat { surface?.barHeight ?? barHeightFallback }
+    private var pillHeight: CGFloat { barHeight - 8 }
+    // The workspace chip is a SQUARE, which is what a 20x20 chipBox and a
+    // 20 chipPillHeight meant at the shipped bar height. Deriving the
+    // height from barHeight alone turned it into a rectangle on any
+    // shorter bar and shrank the icon with it. Track chipBox instead, and
+    // only give way when the bracket is too short to hold it.
+    private var chipPillHeight: CGFloat { min(chipBox, pillHeight - 2) }
+    private var chipIcon: CGFloat { chipPillHeight - 2 }
+    // A 4 point radius on a 20 point square reads as a rounded rectangle.
+    // Roughly a quarter of the side is what makes it read as a rounded
+    // square, which is the shape an app icon already is.
+    private var chipRadius: CGFloat { chipPillHeight * 0.28 }
 
     override var isFlipped: Bool { false }
 
@@ -2854,8 +2948,9 @@ final class BarWindow: NSWindow {
 
 // The bar owns the top strip. OMACOSY_BAR_STACK=1 drops it one bar-height
 // so it can run alongside another bar for comparison, which is how this
-// was built.
-let stackOffset: CGFloat = ProcessInfo.processInfo.environment["OMACOSY_BAR_STACK"] == nil ? 0 : barHeight
+// was built. The drop is one STRIP of the display it is on, so the stacked
+// bars of two displays of different strips stay out of each other's menus.
+let barStacked = ProcessInfo.processInfo.environment["OMACOSY_BAR_STACK"] != nil
 
 // One surface per display. Each owns its screen's workspace set and its
 // own window; everything else it reads from the shared model.
@@ -2868,6 +2963,11 @@ final class BarSurface {
     let window: BarWindow
     let view: BarView
 
+    // This display's own menu-bar strip, re-read every place() so a
+    // resolution change moves the bar with it. The Window Server's
+    // Menubar window is per-display; menuBarHeight is not.
+    private(set) var barHeight: CGFloat
+
     // A notched display has no usable centre, so the media capsule joins
     // the left cluster there — the same rule the shell bar applies, but
     // read from the screen itself instead of asked of a helper.
@@ -2876,8 +2976,10 @@ final class BarSurface {
     init(screen: NSScreen, monitorID: String) {
         self.screen = screen
         self.monitorID = monitorID
-        let frame = NSRect(x: screen.frame.minX, y: screen.frame.maxY - barHeight - stackOffset,
-                           width: screen.frame.width, height: barHeight)
+        let h = menuBarHeight(for: screen)
+        self.barHeight = h
+        let frame = NSRect(x: screen.frame.minX, y: screen.frame.maxY - h * (barStacked ? 2 : 1),
+                           width: screen.frame.width, height: h)
         window = BarWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
         window.isOpaque = false
         window.backgroundColor = .clear
@@ -2904,7 +3006,10 @@ final class BarSurface {
     }
 
     func place() {
-        let frame = NSRect(x: screen.frame.minX, y: screen.frame.maxY - barHeight - stackOffset,
+        // Re-read the strip: a resolution change rescales it, and this
+        // runs from the screen-parameters handler after one.
+        barHeight = menuBarHeight(for: screen)
+        let frame = NSRect(x: screen.frame.minX, y: screen.frame.maxY - barHeight * (barStacked ? 2 : 1),
                            width: screen.frame.width, height: barHeight)
         window.setFrame(frame, display: true)
         view.frame = NSRect(origin: .zero, size: frame.size)
@@ -3106,7 +3211,9 @@ func pointerAtScreenTop() {
         if fullscreenDisplays().contains(screenID(screen)) {
             setRevealed(true)
         }
-    } else if revealed, openPopup == nil, fromTop > barHeight + 12 {
+    } else if revealed, openPopup == nil,
+              fromTop > (surfaces.first(where: { screenID($0.screen) == screenID(screen) })?.barHeight
+                           ?? barHeightFallback) + 12 {
         // a popup keeps it up: its anchor must not vanish under the pointer
         setRevealed(false)
     }

@@ -8,6 +8,16 @@
 //                           browser chord asks this at press time
 //   default-app <scheme>    the bundle id of the app macOS opens <scheme>
 //                           with (e.g. mailto); bin/omacosy-open asks this
+//   bar-height              the height macOS draws the menu bar at, in
+//                           points; install.sh reserves room for the bar
+//                           from it
+//   bar-height-external     the EXTERNAL display's own menu-bar height —
+//                           bar-height follows the main display only, and
+//                           a notched built-in's strip is taller; fails
+//                           with no external up
+//   safe-top                the built-in display's notch inset in points
+//                           (0 = no notch); install.sh sizes the top gap
+//                           from it
 //   wallpaper <path>        set the desktop picture on every screen
 //   wallpaper resync        put the recorded picture back on any screen
 //                           that shows an older omacosy picture
@@ -183,6 +193,79 @@ case "default-app":
     // `default-browser`.
     guard args.count > 2, let bid = defaultHandler(args[2]) else { exit(1) }
     print(bid)
+
+case "bar-height":
+    // How tall macOS draws the menu bar, in points. install.sh reserves room
+    // for the bar with it. Asked rather than assumed, for the same reason
+    // safe-top is read from the screen: a number matched against a guess goes
+    // stale on hardware that does not exist yet. Measured here macOS says 30,
+    // so a hardcoded 34 over-reserved by four points, and a hardcoded number
+    // is wrong in whichever direction Apple next moves it.
+    //
+    // macOS will not tell a process how tall the menu bar is unless it has a
+    // menu of its own, and a command-line tool has none. An empty NSMenu is
+    // enough to be told, and it draws nothing: this prints and exits.
+    if NSApplication.shared.mainMenu == nil { NSApplication.shared.mainMenu = NSMenu() }
+    guard let h = NSApplication.shared.mainMenu?.menuBarHeight, h > 0 else { exit(1) }
+    print(Int(h.rounded()))
+
+case "bar-height-external":
+    // The same question for the EXTERNAL display, which has its own answer:
+    // the read above reports only the MAIN display's strip, and a notched
+    // built-in's strip is taller than any external's. install.sh sizes the
+    // external monitor's top gap with this, so the gap follows the bar the
+    // external actually draws. The Window Server keeps one Menubar window
+    // per display at that display's strip height, listed even while the
+    // bar is auto-hidden (slid just off the top edge); match one to the
+    // external screen by x/width and its edge at the display top. Prints
+    // nothing and fails when no external is up, which is install.sh's
+    // signal to keep the main-display value. The window NAME is not used:
+    // kCGWindowName needs Screen Recording; the strip's layer plus one of
+    // its two known owners is enough to pick it out.
+    let builtin = builtinDisplayID()
+    guard let ext = NSScreen.screens.first(where: {
+        (($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+            ?? 0) != builtin
+    }) else { exit(1) }
+    let primaryH = NSScreen.screens.first?.frame.height ?? 0
+    let topY = primaryH - ext.frame.maxY
+    let menuLevel = Int(CGWindowLevelForKey(.mainMenuWindow))
+    let list = (CGWindowListCopyWindowInfo([], kCGNullWindowID) as? [[String: Any]]) ?? []
+    var agentHeight: CGFloat = 0
+    for w in list {
+        guard (w[kCGWindowLayer as String] as? Int) == menuLevel,
+              let owner = w[kCGWindowOwnerName as String] as? String,
+              owner == "Window Server" || owner == "MenuBarAgent",
+              let b = w[kCGWindowBounds as String] as? [String: CGFloat],
+              let x = b["X"], let y = b["Y"], let width = b["Width"],
+              let height = b["Height"], height > 0,
+              height < ext.frame.height / 4
+        else { continue }
+        // the strip touches the display's top edge whether auto-hidden
+        // (slid just above it), shown (just below), or mid-slide
+        if abs(x - ext.frame.minX) < 2, abs(width - ext.frame.width) < 2,
+           y <= topY + 2, y + height >= topY - 2 {
+            if owner == "Window Server" { print(Int(height.rounded())); exit(0) }
+            if agentHeight == 0 { agentHeight = height }
+        }
+    }
+    if agentHeight > 0 { print(Int(agentHeight.rounded())); exit(0) }
+    exit(1)
+
+case "safe-top":
+    // A notched display reports usable space starting below the camera
+    // strip, so anything measured from there is already clear of it and
+    // needs a smaller gap than a flat panel. Print the offset macOS
+    // reports for the built-in display, in points, 0 where there is no
+    // notch; install.sh turns it into aerospace's outer.top. Read from
+    // the screen rather than matched against a table of models, which
+    // would go stale on hardware that does not exist yet.
+    let builtin = builtinDisplayID()
+    let panel = NSScreen.screens.first {
+        ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?
+            .uint32Value == builtin
+    }
+    print(Int(panel?.safeAreaInsets.top ?? 0))
 
 case "wallpaper":
     guard args.count > 2 else {
@@ -442,13 +525,33 @@ case "split-hint":
         return (sample, moved)
     }
     // Direction: Hyprland's rule is `stack when h * multiplier > w`
-    // (dwindle:split_width_multiplier, default 1.0). At 1.0 an
-    // ultrawide's half-slot (1712x1389) is still wider than tall, so
-    // the spiral goes side-by-side twice before it ever stacks. 1.4
-    // makes that half-slot stack first, which restores the 16:9
-    // left/down/left cadence on a 3440-wide display without changing
-    // behavior on displays where the half is already taller than wide.
-    let splitWidthMultiplier: CGFloat = 1.4
+    // (dwindle:split_width_multiplier, default 1.0). At 1.0 an ultrawide's
+    // half-slot (1712x1389) is still wider than tall, so the spiral goes
+    // side-by-side twice before it ever stacks. 1.4 makes that half-slot
+    // stack first, restoring the 16:9 left/down/left cadence on a 3440-wide
+    // display. On a narrower display 1.4 instead stacks slots that are wider
+    // than tall, so the direction looks random; there Hyprland's 1.0 applies.
+    //
+    // The multiplier belongs to the display the window is on, not the main
+    // one: a laptop beside an ultrawide must use each screen's own width.
+    // The window's frame is read here anyway for the refocus path, so its
+    // centre names the display. The 2560 threshold is a judgement call, not a
+    // measured boundary.
+    let winFrame = frame()
+    func splitMultiplier(for f: (CGFloat, CGFloat, CGFloat, CGFloat)?) -> CGFloat {
+        let wide: CGFloat = 2560
+        guard let f else { return CGDisplayBounds(CGMainDisplayID()).width >= wide ? 1.4 : 1.0 }
+        let center = CGPoint(x: f.0 + f.2 / 2, y: f.1 + f.3 / 2)
+        var ids = [CGDirectDisplayID](repeating: 0, count: 8)
+        var n: UInt32 = 0
+        if CGGetActiveDisplayList(8, &ids, &n) == .success {
+            for i in 0..<Int(n) where CGDisplayBounds(ids[i]).contains(center) {
+                return CGDisplayBounds(ids[i]).width >= wide ? 1.4 : 1.0
+            }
+        }
+        return CGDisplayBounds(CGMainDisplayID()).width >= wide ? 1.4 : 1.0
+    }
+    let splitWidthMultiplier = splitMultiplier(for: winFrame)
     func direction(_ w: CGFloat, _ h: CGFloat) -> String {
         w >= h * splitWidthMultiplier ? "horizontal" : "vertical"
     }
@@ -531,7 +634,7 @@ case "split-hint":
         // been checked yet is how a close poisoned the whole burst.
         if s.w >= s.h * splitWidthMultiplier { w = s.w / 2; h = s.h } else { w = s.w; h = s.h / 2 }
         how = "predicted"
-    } else if state != nil, wid <= max(maxWid, state!.wid), let f = frame() {
+    } else if state != nil, wid <= max(maxWid, state!.wid), let f = winFrame {
         // an existing window refocused mid-burst: usually settled, and
         // checked below for when it is not
         (w, h) = (f.2, f.3)

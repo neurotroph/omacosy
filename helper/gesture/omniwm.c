@@ -31,7 +31,14 @@ static void socket_path(char* out, size_t n)
 	if (env && *env) { snprintf(out, n, "%s", env); return; }
 	const char* home = getenv("HOME");
 	if (!home || !*home) { struct passwd* pw = getpwuid(getuid()); home = pw ? pw->pw_dir : "/"; }
-	snprintf(out, n, "%s/Library/Caches/com.barut.OmniWM/ipc.sock", home);
+	// OmniWM 0.7.5 moved the IPC socket from ~/Library/Caches to
+	// ~/Library/Application Support. Prefer the current location and
+	// fall back to the legacy one when only it exists (OmniWM <= 0.7.4).
+	snprintf(out, n, "%s/Library/Application Support/com.barut.OmniWM/ipc.sock", home);
+	char legacy[512];
+	snprintf(legacy, sizeof legacy, "%s/Library/Caches/com.barut.OmniWM/ipc.sock", home);
+	if (access(out, R_OK) != 0 && access(legacy, R_OK) == 0)
+		snprintf(out, n, "%s", legacy);
 }
 
 bool omniwm_available(void)

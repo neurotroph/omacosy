@@ -64,10 +64,17 @@ inner.vertical = 8
 outer.left = 8
 outer.bottom = 8
 outer.right = 8
-# room for the bar: measured from the display top on flat monitors,
-# but from below the notch strip on built-in notched displays (macOS
-# reports usable space starting there), so the laptop needs less
-outer.top = [{ monitor.'built-in' = 10 }, 42]
+# room for the bar, sized at install time from the built-in display's
+# safe-area inset (`omacosy-helper safe-top`). A notched display reports
+# usable space starting below the camera strip, so the bar already fits
+# in space no window can use and only the margin is left to reserve; a
+# flat panel reports nothing, so the bar's full height is reserved. The
+# question is whether the display has a notch, which is not the same set
+# as whether it is built in: every Apple Silicon laptop before the 2021
+# 14"/16" MacBook Pro is built in and has no notch. No external display
+# has a notch either, so the second entry is the same sum with nothing
+# taken off it.
+outer.top = [{ monitor.'built-in' = @OUTER_TOP@ }, @OUTER_TOP_EXT@]
 
 # Fixed-size settings windows fight the tiler (resize -> snap back ->
 # relayout flicker); float them instead.
@@ -129,7 +136,13 @@ cmd-ctrl-alt-s = 'exec-and-forget $HOME/.local/bin/omacosy-float'
 # wrapper-aware: the dwindle hint's solo container makes the bare
 # commands no-op or misfire (issue #3) — omacosy-layout compensates
 cmd-ctrl-alt-j = 'exec-and-forget $HOME/.local/bin/omacosy-layout togglesplit'
-cmd-ctrl-alt-f = 'fullscreen --no-outer-gaps'
+# Fullscreen: zoom one window inside its workspace.
+# NOT `--no-outer-gaps`. That flag drops the top gap too, which is the strip
+# omacosy-bar is drawn in, so Super+F covered the bar and came out
+# pixel-identical to Super+N below: both ignore the gaps and land at 0,0.
+# With the gaps kept, a zoomed window matches the tiling it came from and
+# keeps its focus ring, so it still reads as one window among several.
+cmd-ctrl-alt-f = 'fullscreen'
 # native (green-button) fullscreen: the only mode that may claim the
 # notch strip on the built-in display; deliberate enter/exit only
 cmd-ctrl-alt-n = 'macos-native-fullscreen'

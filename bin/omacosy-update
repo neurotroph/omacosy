@@ -34,9 +34,15 @@ BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
 say "clone: $REPO (on $BRANCH)"
 
 # Your own edits win: a pull that would stash or merge them is not
-# something a one-word command should decide for you.
-if [ -n "$(git -C "$REPO" status --porcelain)" ]; then
-  git -C "$REPO" status --short | sed 's/^/    /'
+# something a one-word command should decide for you. Only TRACKED edits
+# block an update. Untracked files — build output the installer wrote, or
+# a new file of your own — do not: a fast-forward cannot silently
+# overwrite them, git refuses the merge instead and the failure is
+# reported below. Blocking on them is what left every clone installed to
+# the default location permanently stuck, because install.sh writes an
+# untracked omacosy-ffm.app into it.
+if [ -n "$(git -C "$REPO" status --porcelain --untracked-files=no)" ]; then
+  git -C "$REPO" status --short --untracked-files=no | sed 's/^/    /'
   die "the clone has local changes — commit, stash or discard them first"
 fi
 

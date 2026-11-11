@@ -18,8 +18,6 @@
 
 #define CLI_BUFFER_SIZE 8192
 #define MAX_FRAME_SIZE (16 * 1024 * 1024)
-#define SOCKET_CONNECT_MAX_ATTEMPTS 30
-#define SOCKET_CONNECT_RETRY_USEC 1000000
 #define SOCKET_IO_TIMEOUT_SEC 5
 #define SOCKET_PROTOCOL_VERSION 1
 
@@ -170,7 +168,7 @@ static const char* aerospace_cli_path(void)
 	return resolved;
 }
 
-static bool aerospace_open_socket(aerospace* client, int attempts);
+static bool aerospace_open_socket(aerospace* client);
 
 static char* execute_cli_command(const char* command_string, int* exit_code)
 {
@@ -321,7 +319,7 @@ static char* execute_aerospace_command(aerospace* client, const char** args, int
 	// used to strand the daemon in CLI mode for the rest of the
 	// session; every swipe after docking silently did nothing. If we
 	// have no fd, try the socket again before settling for the CLI.
-	if (client->fd < 0 && aerospace_open_socket(client, 1))
+	if (client->fd < 0 && aerospace_open_socket(client))
 		client->use_cli_fallback = false;
 
 	if (client->use_cli_fallback) {
@@ -388,11 +386,12 @@ static char* execute_aerospace_command(aerospace* client, const char** args, int
 	return result;
 }
 
-// Connect and negotiate, `attempts` times with backoff. Startup gives
-// it the full budget because AeroSpace may not be up yet at login; a
-// mid-session reconnect gets one shot, because it runs on the gesture
-// path and a swipe must not block.
-static bool aerospace_open_socket(aerospace* client, int attempts)
+// Connect and negotiate. One attempt only: AeroSpace may not be up yet at
+// login, but a failed connect is not fatal. execute_aerospace_command
+// retries the socket whenever it has no fd, and the CLI carries the session
+// until then, so a startup retry loop only blocks the caller — and, at
+// login, the trackpad arming behind it.
+static bool aerospace_open_socket(aerospace* client)
 {
 	struct sockaddr_un addr;
 	memset(&addr, 0, sizeof(struct sockaddr_un));
@@ -400,39 +399,25 @@ static bool aerospace_open_socket(aerospace* client, int attempts)
 	strncpy(addr.sun_path, client->socket_path, sizeof(addr.sun_path) - 1);
 	addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
 
-	int connect_errno = 0;
-	for (int attempt = 0; attempt < attempts; attempt++) {
-		errno = 0;
-		client->fd = socket(AF_UNIX, SOCK_STREAM, 0);
-		if (client->fd < 0) {
-			connect_errno = errno;
-			// used to be fatal; a daemon that dies here loses every
-			// gesture, and the CLI fallback can carry the session
-			fprintf(stderr, "%s: %s (errno %d)\n", ERROR_SOCKET_CREATE,
-				strerror(connect_errno), connect_errno);
-			break;
-		}
-
-		errno = 0;
-		if (connect(client->fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-			connect_errno = 0;
-			break;
-		}
-		connect_errno = errno;
-		close(client->fd);
-		client->fd = -1;
-		if (attempt + 1 < attempts) {
-			usleep(SOCKET_CONNECT_RETRY_USEC);
-		}
-	}
-
-	if (connect_errno != 0) {
-		if (client->fd >= 0) {
-			close(client->fd);
-			client->fd = -1;
-		}
+	errno = 0;
+	client->fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (client->fd < 0) {
+		// used to be fatal; a daemon that dies here loses every
+		// gesture, and the CLI fallback can carry the session
+		fprintf(stderr, "%s: %s (errno %d)\n", ERROR_SOCKET_CREATE,
+			strerror(errno), errno);
 		return false;
 	}
+
+	errno = 0;
+	if (connect(client->fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+		int why = errno;
+		close(client->fd);
+		client->fd = -1;
+		errno = why;   // keep the reason for the caller's warning
+		return false;
+	}
+
 	if (!configure_socket_timeouts(client->fd) || !perform_protocol_handshake(client)) {
 		close(client->fd);
 		client->fd = -1;
@@ -461,10 +446,11 @@ aerospace* aerospace_new(const char* socketPath)
 	else
 		client->socket_path = get_default_socket_path();
 
-	// AeroSpace may not be ready when we start (e.g. at login). Retry the
-	// connect with bounded backoff before giving up and falling back to CLI,
-	// otherwise we get stuck in CLI mode for the entire session.
-	if (!aerospace_open_socket(client, SOCKET_CONNECT_MAX_ATTEMPTS)) {
+	// AeroSpace may not be ready when we start (e.g. at login). A failed
+	// connect is not fatal: execute_aerospace_command retries the socket
+	// whenever it has no fd, so the CLI carries the session until then
+	// rather than blocking startup on a retry loop.
+	if (!aerospace_open_socket(client)) {
 		int why = errno;
 		fprintf(stderr, WARN_CLI_FALLBACK, client->socket_path, strerror(why), why);
 		client->use_cli_fallback = true;

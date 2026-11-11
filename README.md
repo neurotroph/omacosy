@@ -86,7 +86,7 @@ grant hide themselves rather than half-work.
 
 | Grant | Who asks | What it does | Without it |
 |---|---|---|---|
-| **Accessibility** | AeroSpace *or* OmniWM, `omacosy-gesture`, `omacosy-bar` (reads the focused app's menus for the app-pill popup), `omacosy-ffm` (AeroSpace mode only) | Move, resize and focus other apps' windows. This is the tiling itself, and it is the broadest permission here. | Nothing tiles. Not optional in practice. |
+| **Accessibility** | AeroSpace *or* OmniWM, `omacosy-gesture`, `omacosy-bar` (reads the focused app's menus for the app-pill popup), `omacosy-ffm` (AeroSpace mode only), `omacosy-borders` (optional; hears the ringed window close) | Move, resize and focus other apps' windows. This is the tiling itself, and it is the broadest permission here. The focus ring uses it only to hear an app report that the ringed window is closing. | Nothing tiles. Not optional in practice. Without it for `omacosy-borders` alone, the ring leaves a window closed with Cmd-W about 0.25 s later. |
 | **Input Monitoring** | Karabiner-Elements, `omacosy-gesture` (and OmniWM, under that option) | Karabiner reads keys to remap Caps Lock; `omacosy-gesture` reads raw trackpad contacts, because macOS 26 stopped carrying touch data in normal events. | No Super key, no swipe gestures. |
 | **Screen Recording** | the program that first starts `omacosy-overview` ([see below](#permissions)) | Captures a thumbnail per window for the overview cards, including windows the window manager has stashed offscreen. A screenshot of the visible screen could not see those. | Cards fall back to app icons and titles. |
 | **Bluetooth** | `omacosy-bar` | Reads adapter power and the paired-device list for the bluetooth pill and its menu. | The pill hides itself. |
@@ -123,6 +123,12 @@ something else, and the swipe is the only way in.
   request arrives on; no coordinates are gathered or sent, and the bar
   holds no location API. Delete the weather pill and nothing leaves the
   machine.
+- **The focus ring only listens.** `omacosy-borders` asks for
+  Accessibility to hear an app report that the ringed window is closing.
+  It reads the app's window list and registers for that one report on
+  that one window. It never clicks, types, moves a window or reads what a
+  window shows. Refuse the grant and the ring still works; a window
+  closed with Cmd-W keeps its ring about 0.25 s longer.
 - **omacosy's own binaries never run as root.** `install.sh` uses no
   sudo, installs no LaunchDaemon, and every helper it builds runs as
   you, in your login session.
@@ -228,7 +234,9 @@ Why so much of it is self-built:
 - **JankyBorders** keeps a bitmap per window and costs hundreds of MB.
   `omacosy-borders` strokes one CAShapeLayer that the WindowServer
   rasterizes, driven by SkyLight notifications for focus, move and
-  resize, so the ring glides with drags without polling.
+  resize, so the ring glides with drags without polling. With
+  Accessibility it also hears an app report that the ringed window is
+  closing, so the ring is gone before the window starts to fade.
 - **Mission Control** cannot see AeroSpace's virtual workspaces, so a
   workspace overview cannot be had any other way than
   `omacosy-overview` capturing them itself.
@@ -339,11 +347,32 @@ startup and does no config-file or image-file I/O while it draws.
 - **Floats**: appears only while the workspace holds floating windows;
   click surfaces the next one.
 
+Weather defaults to Celsius and uses the public IP address for location,
+so it follows a VPN exit node. Override either preference without editing
+the repo:
+
+```bash
+omacosy-weather unit fahrenheit
+omacosy-weather location 10001
+omacosy-weather location "Chicago"
+omacosy-weather location auto       # follow the VPN/public IP again
+omacosy-weather status
+```
+
+The command restarts only the bar so the next weather fetch uses the new
+preference immediately. Settings live in `~/.config/omacosy/weather.json`.
+
 ## Keybindings — Super = hold Caps Lock
 
 Karabiner remaps Caps Lock to `cmd+ctrl+alt` (a combo macOS never
 uses), so omarchy's scheme works letter-for-letter without breaking
 typing or app shortcuts. Caps Lock tapped alone is Escape.
+
+A new keyboard whose Caps Lock still toggles caps: Karabiner leaves a
+device alone when it also reports as a pointing device, which many
+Hall-effect and Bluetooth boards do. Turn on **Modify events** for it in
+Karabiner-Elements → Settings → Devices. `install.sh` keeps that switch
+on re-runs and names such keyboards when it finds one connected.
 
 | Chord | Action |
 |---|---|
@@ -365,7 +394,7 @@ typing or app shortcuts. Caps Lock tapped alone is Escape.
 | `Super+t` | toggle floating |
 | `Super+j` | toggle split direction |
 | `Super+-` / `Super+=` | resize |
-| `Super+f` | fullscreen — on notched displays the camera strip is blacked out so it reads as true fullscreen, while the window stays in its workspace (swipes still reach it) |
+| `Super+f` | zoom the focused window inside its workspace — the outer gaps and the bar strip stay, so it reads as one enlarged tile rather than true fullscreen (it stays in its workspace; swipes still reach it) |
 | `Super+n` | native macOS fullscreen (a separate Space — outside the workspace model, avoid unless an app needs it) |
 | `Super+r` | resize mode (`h/j/k/l`, `-`/`=`, `esc`) — AeroSpace only; OmniWM has no binding modes |
 | `Super+shift+;` | service mode (`esc` reload, `r` flatten, `⌫` close others) |
